@@ -1,0 +1,51 @@
+name: Sync upstream master
+
+on:
+  schedule:
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Sync master and create pull request
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh api \
+            --method POST \
+            "/repos/${GITHUB_REPOSITORY}/merge-upstream" \
+            -f branch=master
+          git fetch origin master custom-master
+
+          if git merge-base --is-ancestor origin/master origin/custom-master; then
+            echo "custom-master already contains master."
+            exit 0
+          fi
+
+          if gh pr list \
+            --base custom-master \
+            --head master \
+            --state open \
+            --json number \
+            --jq 'length > 0' | grep -qx true; then
+            echo "An open pull request from master to custom-master already exists."
+            exit 0
+          fi
+
+          gh pr create \
+            --base custom-master \
+            --head master \
+            --title "Sync upstream master" \
+            --body "Automated pull request to merge the fork's master branch, synchronized from https://github.com/renode/renode-infrastructure, into custom-master."
