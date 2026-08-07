@@ -6,14 +6,17 @@
 //
 using System;
 using System.Collections.Generic;
+using System.Runtime.InteropServices;
 
+using Antmicro.Renode.Core;
 using Antmicro.Renode.Utilities;
 
+using AntShell.Helpers;
 using AntShell.Terminal;
 
 namespace Antmicro.Renode.UI
 {
-    public class ConsoleIOSource : IActiveIOSource
+    public class ConsoleIOSource : IActiveIOSource, ISizeSource
     {
         public ConsoleIOSource()
         {
@@ -21,6 +24,13 @@ namespace Antmicro.Renode.UI
             if(!isInputRedirected)
             {
                 Console.TreatControlCAsInput = true;
+            }
+            if(!RuntimeInfo.IsWindows())
+            {
+                winchRegistration = PosixSignalRegistration.Create(
+                    PosixSignal.SIGWINCH,
+                    _ => Resized()
+                );
             }
 
             checker = new UTF8Checker();
@@ -36,6 +46,7 @@ namespace Antmicro.Renode.UI
 
         public void Dispose()
         {
+            winchRegistration?.Dispose();
         }
 
         public void Flush()
@@ -71,7 +82,25 @@ namespace Antmicro.Renode.UI
 
         public bool IsAnythingAttached => (ByteRead != null);
 
+        public Position Size
+        {
+            get
+            {
+                try
+                {
+                    return new Position(Math.Max(Console.WindowWidth, 0), Math.Max(Console.WindowHeight, 0));
+                }
+                // The window size accessors throw on Windows if all standard FDs aren't consoles
+                catch
+                {
+                    return new Position(0, 0);
+                }
+            }
+        }
+
         public event Action<int> ByteRead;
+
+        public event Action Resized = () => {};
 
         private void HandleInput()
         {
@@ -165,6 +194,8 @@ namespace Antmicro.Renode.UI
                 }
             }
         }
+
+        private readonly PosixSignalRegistration winchRegistration;
 
         private readonly UTF8Checker checker;
         private readonly bool isInputRedirected;

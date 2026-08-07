@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2010-2025 Antmicro
+// Copyright (c) 2010-2026 Antmicro
 //
 // This file is licensed under the MIT License.
 // Full license text is available in 'licenses/MIT.txt'.
@@ -25,6 +25,11 @@ namespace Antmicro.Renode.Peripherals.Bus
         public BusControllerProxy(IBusController parentController)
         {
             ParentController = parentController;
+        }
+
+        public void UnmapMemory(Range range, ICPU context = null)
+        {
+            ParentController.UnmapMemory(range, context);
         }
 
         public void Reset()
@@ -169,6 +174,16 @@ namespace Antmicro.Renode.Peripherals.Bus
             return ReadBytes((ulong)offset, count, context: context);
         }
 
+        public virtual ulong[] FindBytes(byte[] pattern, ulong startAddress = 0, ulong? endAddress = null, IPeripheral context = null)
+        {
+            return ParentController.FindBytes(pattern, startAddress, endAddress, context);
+        }
+
+        public virtual ulong[] FindBytes(string hexString, ulong startAddress = 0, ulong? endAddress = null, IPeripheral context = null)
+        {
+            return ParentController.FindBytes(hexString, startAddress, endAddress, context);
+        }
+
         public virtual void WriteBytes(byte[] bytes, ulong address, bool onlyMemory = false, IPeripheral context = null)
         {
             WriteBytes(bytes, address, bytes.Length, onlyMemory, context);
@@ -208,10 +223,10 @@ namespace Antmicro.Renode.Peripherals.Bus
             return ParentController.WhatIsAt(address, context);
         }
 
-        public virtual IPeripheral WhatPeripheralIsAt(ulong address, IPeripheral context = null)
+        public virtual IPeripheral WhatPeripheralIsAt(ulong address, IPeripheral context = null, ulong? initiatorState = null)
         {
             ValidateOperation(ref address, BusAccessPrivileges.Other, context);
-            return ParentController.WhatPeripheralIsAt(address, context);
+            return ParentController.WhatPeripheralIsAt(address, context, initiatorState);
         }
 
         public virtual IEnumerable<ICPU> GetCPUs()
@@ -399,19 +414,19 @@ namespace Antmicro.Renode.Peripherals.Bus
             ParentController.ChangePeripheralAccessCondition(peripheral, newCondition, oldCondition);
         }
 
-        void IPeripheralRegister<IBusPeripheral, BusMultiRegistration>.Unregister(IBusPeripheral peripheral)
+        void IRegisterablePeripheral<IBusPeripheral, BusMultiRegistration>.Unregister(IBusPeripheral peripheral)
         {
-            ((IPeripheralRegister<IBusPeripheral, BusMultiRegistration>)ParentController).Unregister(peripheral);
+            ((IRegisterablePeripheral<IBusPeripheral, BusMultiRegistration>)ParentController).Unregister(peripheral);
         }
 
-        void IPeripheralRegister<IBusPeripheral, BusRangeRegistration>.Unregister(IBusPeripheral peripheral)
+        void IRegisterablePeripheral<IBusPeripheral, BusRangeRegistration>.Unregister(IBusPeripheral peripheral)
         {
-            ((IPeripheralRegister<IBusPeripheral, BusRangeRegistration>)ParentController).Unregister(peripheral);
+            ((IRegisterablePeripheral<IBusPeripheral, BusRangeRegistration>)ParentController).Unregister(peripheral);
         }
 
-        void IPeripheralRegister<IBusPeripheral, BusParametrizedRegistration>.Unregister(IBusPeripheral peripheral)
+        void IRegisterablePeripheral<IBusPeripheral, BusParametrizedRegistration>.Unregister(IBusPeripheral peripheral)
         {
-            ((IPeripheralRegister<IBusPeripheral, BusParametrizedRegistration>)ParentController).Unregister(peripheral);
+            ((IRegisterablePeripheral<IBusPeripheral, BusParametrizedRegistration>)ParentController).Unregister(peripheral);
         }
 
         public void Unregister(IPeripheral peripheral)
@@ -523,6 +538,8 @@ namespace Antmicro.Renode.Peripherals.Bus
         public virtual IBusController ParentController { get; protected set; }
 
         public virtual Endianess Endianess => ParentController.Endianess;
+
+        public UnhandledAccessBehaviour UnhandledAccessBehaviour { get => ParentController.UnhandledAccessBehaviour; set => ParentController.UnhandledAccessBehaviour = value; }
 
         protected virtual bool ValidateOperation(ref ulong address, BusAccessPrivileges accessType, IPeripheral context = null)
         {

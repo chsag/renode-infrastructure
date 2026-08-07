@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2010-2025 Antmicro
+// Copyright (c) 2010-2026 Antmicro
 //
 // This file is licensed under the MIT License.
 // Full license text is available in 'licenses/MIT.txt'.
@@ -360,6 +360,67 @@ namespace Antmicro.Renode.UnitTests
         }
 
         [Test]
+        public void TestMultiargumentPresentIfMethod()
+        {
+            // The first three bytes determine which optional fields are present in the packet.
+            // `Field1xor2` is present only if the first three bytes contain either 1 or 2 (but not both).
+            // `Field3and4` is present only if the first three bytes contain both 3 and 4.
+
+            var dataHasNone = new byte[] { 0, 1, 2 };
+            var structureHasNone = Packet.Decode<TestStructMultiargPresentIfMethod>(dataHasNone);
+            Assert.AreEqual(null, structureHasNone.Field1xor2);
+            Assert.AreEqual(null, structureHasNone.Field3and4);
+
+            var dataHasField1xor2 = new byte[] { 0, 0, 1, 1 };
+            var structureHasField1xor2 = Packet.Decode<TestStructMultiargPresentIfMethod>(dataHasField1xor2);
+            Assert.AreEqual(1, structureHasField1xor2.Field1xor2);
+            Assert.AreEqual(null, structureHasField1xor2.Field3and4);
+
+            var dataHasField2and3 = new byte[] { 0, 3, 4, 1 };
+            var structureHasField2and3 = Packet.Decode<TestStructMultiargPresentIfMethod>(dataHasField2and3);
+            Assert.AreEqual(null, structureHasField2and3.Field1xor2);
+            Assert.AreEqual(1, structureHasField2and3.Field3and4);
+
+            var dataHasAllFields = new byte[] { 1, 3, 4, 1, 2 };
+            var structureHasAllFields = Packet.Decode<TestStructMultiargPresentIfMethod>(dataHasAllFields);
+            Assert.AreEqual(1, structureHasAllFields.Field1xor2);
+            Assert.AreEqual(2, structureHasAllFields.Field3and4);
+        }
+
+        public void TestDecodeInto()
+        {
+            var data = new byte[] { 1, 2 };
+
+            var targetNoFields = new TestStructDecodeInto { Mask = TestFieldEnum.None };
+            Assert.IsTrue(Packet.TryDecodeInto(data, ref targetNoFields));
+            Assert.AreEqual(targetNoFields.FieldA, null);
+            Assert.AreEqual(targetNoFields.FieldB, null);
+            var encNoFields = Packet.Encode(targetNoFields);
+            Assert.AreEqual(encNoFields, new byte[] { });
+
+            var targetHasA = new TestStructDecodeInto { Mask = TestFieldEnum.A };
+            Assert.IsTrue(Packet.TryDecodeInto(data, ref targetHasA));
+            Assert.AreEqual(targetHasA.FieldA, 1);
+            Assert.AreEqual(targetHasA.FieldB, null);
+            var encHasA = Packet.Encode(targetHasA);
+            Assert.AreEqual(encHasA, new byte[] { 1 });
+
+            var targetHasB = new TestStructDecodeInto { Mask = TestFieldEnum.B };
+            Assert.IsTrue(Packet.TryDecodeInto(data, ref targetHasB));
+            Assert.AreEqual(targetHasB.FieldA, null);
+            Assert.AreEqual(targetHasB.FieldB, 1);
+            var encHasB = Packet.Encode(targetHasB);
+            Assert.AreEqual(encHasB, new byte[] { 1 });
+
+            var targetHasAandB = new TestStructDecodeInto { Mask = TestFieldEnum.A | TestFieldEnum.B };
+            Assert.IsTrue(Packet.TryDecodeInto(data, ref targetHasAandB));
+            Assert.AreEqual(targetHasAandB.FieldA, 1);
+            Assert.AreEqual(targetHasAandB.FieldB, 2);
+            var encHasAandB = Packet.Encode(targetHasAandB);
+            Assert.AreEqual(encHasAandB, new byte[] { 1, 2 });
+        }
+
+        [Test]
         public void TestPresentIfBitfield()
         {
             // No fields (Mask = 0)
@@ -449,6 +510,14 @@ namespace Antmicro.Renode.UnitTests
             Assert.IsTrue(structurePresent.Nested.Flag);
             Assert.AreEqual(0x11223344, structurePresent.Nested.Val);
             Assert.AreEqual(0x55, structurePresent.After);
+        }
+
+        [Test]
+        public void TestSerializingReadOnlyProperties()
+        {
+            var data = new TestStructWithReadOnlyProperty();
+            var bytes = Packet.Encode(data);
+            Assert.AreEqual(data.Value, bytes[0]);
         }
 
         [LeastSignificantByteFirst]
@@ -777,8 +846,10 @@ namespace Antmicro.Renode.UnitTests
 #pragma warning disable 649
             [PacketField]
             public bool Flag;
-            [PacketField, PresentIf(nameof(Flag))]
+            [PacketField, PresentIf(nameof(HasVal))]
             public uint Val;
+
+            public bool HasVal() => Flag;
 #pragma warning restore 649
         }
 
@@ -788,10 +859,12 @@ namespace Antmicro.Renode.UnitTests
 #pragma warning disable 649
             [PacketField]
             public bool Flag;
-            [PacketField, PresentIf(nameof(Flag))]
+            [PacketField, PresentIf(nameof(HasFlag))]
             public byte Optional;
             [PacketField]
             public byte Last;
+
+            public bool HasFlag() => Flag;
 #pragma warning restore 649
         }
 
@@ -808,9 +881,48 @@ namespace Antmicro.Renode.UnitTests
             [PacketField, PresentIf(nameof(HasB))]
             public byte? FieldB;
 
-            public bool HasA => (Mask & 1) != 0;
+            public bool HasA() => (Mask & 1) != 0;
 
-            public bool HasB => (Mask & 2) != 0;
+            public bool HasB() => (Mask & 2) != 0;
+#pragma warning restore 649
+        }
+
+        private struct TestStructMultiargPresentIfMethod
+        {
+#pragma warning disable 649
+            [PacketField]
+            public byte Value1;
+            [PacketField]
+            public byte Value2;
+            [PacketField]
+            public byte Value3;
+
+            [PacketField, PresentIf(nameof(HasExaclyIntersection), 1, new byte[]{ 1, 2 })]
+            public byte? Field1xor2;
+
+            [PacketField, PresentIf(nameof(HasExaclyIntersection), 2, new byte[]{ 3, 4 })]
+            public byte? Field3and4;
+
+            public byte[] IntersectingArray => new byte[] { Value1, Value2, Value3 };
+
+            public bool HasExaclyIntersection(int expectedIntersectionCount, byte[] array) => array.Intersect(IntersectingArray).Count() == expectedIntersectionCount;
+#pragma warning restore 649
+        }
+
+        [LeastSignificantByteFirst]
+        private struct TestStructDecodeInto
+        {
+#pragma warning disable 649
+            public TestFieldEnum Mask;
+
+            [PacketField, PresentIf(nameof(HasField), TestFieldEnum.A)]
+            public byte? FieldA;
+
+            [PacketField, PresentIf(nameof(HasField), TestFieldEnum.B)]
+            public byte? FieldB;
+
+            public bool HasField(TestFieldEnum flag) => Mask.HasFlag(flag);
+
 #pragma warning restore 649
         }
 
@@ -826,6 +938,13 @@ namespace Antmicro.Renode.UnitTests
 #pragma warning restore 649
         }
 
+        [LeastSignificantByteFirst]
+        private struct TestStructWithReadOnlyProperty
+        {
+            [PacketField, Width(bits: 8)]
+            public byte Value => 0xAA;
+        }
+
         private enum TestEnumByteType : byte
         {
             One = 1,
@@ -838,6 +957,14 @@ namespace Antmicro.Renode.UnitTests
             One = 1,
             Two,
             Three
+        }
+
+        [Flags]
+        private enum TestFieldEnum : byte
+        {
+            None = 0x0,
+            A = 0x1,
+            B = 0x2,
         }
     }
 }

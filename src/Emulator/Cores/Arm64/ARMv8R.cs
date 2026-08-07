@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2010-2025 Antmicro
+// Copyright (c) 2010-2026 Antmicro
 //
 // This file is licensed under the MIT License.
 // Full license text is available in 'licenses/MIT.txt'.
@@ -13,7 +13,6 @@ using Antmicro.Renode.Core.Structure;
 using Antmicro.Renode.Debugging;
 using Antmicro.Renode.Exceptions;
 using Antmicro.Renode.Logging;
-using Antmicro.Renode.Peripherals.Bus;
 using Antmicro.Renode.Peripherals.IRQControllers;
 using Antmicro.Renode.Peripherals.Timers;
 using Antmicro.Renode.Utilities.Binding;
@@ -22,7 +21,7 @@ using Endianess = ELFSharp.ELF.Endianess;
 
 namespace Antmicro.Renode.Peripherals.CPU
 {
-    public partial class ARMv8R : BaseARMv8, IARMSingleSecurityStateCPU, IPeripheralRegister<ARM_GenericTimer, NullRegistrationPoint>
+    public partial class ARMv8R : BaseARMv8, IARMSingleSecurityStateCPU, IRegisterablePeripheral<ARM_GenericTimer, NullRegistrationPoint>
     {
         public ARMv8R(string cpuType, IMachine machine, ARM_GenericInterruptController genericInterruptController, uint cpuId = 0, Endianess endianness = Endianess.LittleEndian, uint mpuRegionsCount = 16, ulong defaultHVBARValue = 0, ulong defaultVBARValue = 0, uint mpuHyperRegionsCount = 16)
                 : base(cpuId, cpuType, machine, endianness)
@@ -124,6 +123,19 @@ namespace Antmicro.Renode.Peripherals.CPU
             machine.UnregisterAsAChildOf(this, peripheral);
         }
 
+        public override string GetLLVMTriple(uint flags)
+        {
+            if(flags == 0)
+            {
+                throw new ArgumentOutOfRangeException("flags");
+            }
+            if(flags == 0b11)
+            {
+                return AllLLVMTriples[1];
+            }
+            return AllLLVMTriples[0];
+        }
+
         [Export]
         public override uint CheckExternalPermissions(ulong address)
         {
@@ -191,6 +203,10 @@ namespace Antmicro.Renode.Peripherals.CPU
                 return features;
             }
         }
+
+        public override string[] AllLLVMTriples => new[] { "armv8r", "thumb" };
+
+        public override string LLVMModel => Model;
 
         [Export]
         protected void WriteSystemRegisterGenericTimer32(uint offset, uint value)
@@ -285,11 +301,8 @@ namespace Antmicro.Renode.Peripherals.CPU
                     .SingleOrDefault()
                 ;
 
-                registrationPoint = new BusRangeRegistration(
-                    registrationPoint.Range
-                        .MoveToZero()
-                        .ShiftBy((long)newAddress))
-                ;
+                registrationPoint = registrationPoint.Clone();
+                registrationPoint.StartingPoint = newAddress;
 
                 machine.SystemBus
                     .MoveRegistrationWithinContext(tcmConfig.Memory, registrationPoint, this)

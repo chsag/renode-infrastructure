@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2010-2025 Antmicro
+// Copyright (c) 2010-2026 Antmicro
 //
 // This file is licensed under the MIT License.
 // Full license text is available in 'licenses/MIT.txt'.
@@ -12,19 +12,20 @@ using Antmicro.Renode.Exceptions;
 using Antmicro.Renode.Logging;
 using Antmicro.Renode.Peripherals.Memory;
 using Antmicro.Renode.Peripherals.SPI.NORFlash;
+using Antmicro.Renode.Peripherals.SPI.SFDP;
 using Antmicro.Renode.Utilities;
 
 using Range = Antmicro.Renode.Core.Range;
 
 namespace Antmicro.Renode.Peripherals.SPI
 {
-    public partial class GenericSpiFlash : ISPIPeripheral, IGPIOReceiver
+    public class GenericSpiFlash : ISPIPeripheral, IGPIOReceiver, ISFDPPeripheral
     {
         public GenericSpiFlash(MappedMemory underlyingMemory, byte manufacturerId, byte memoryType, byte? capacityCode = null,
             bool writeStatusCanSetWriteEnable = true, byte extendedDeviceId = DefaultExtendedDeviceID,
             byte deviceConfiguration = DefaultDeviceConfiguration, byte remainingIdBytes = DefaultRemainingIDBytes,
             // "Sector" here is the largest erasable memory unit. It's also named "block" by many flash memory vendors.
-            int sectorSizeKB = DefaultSectorSizeKB)
+            int sectorSizeKB = DefaultSectorSizeKB, bool useStatusRegisterStubs = true)
         {
             if(!Misc.IsPowerOfTwo((ulong)underlyingMemory.Size))
             {
@@ -47,6 +48,13 @@ namespace Antmicro.Renode.Peripherals.SPI
                 .WithFlag(0, FieldMode.Read, valueProviderCallback: _ => false, name: "writeInProgress")
                 .WithFlag(1, out enable, writeStatusCanSetWriteEnable ? FieldMode.Read | FieldMode.Write : FieldMode.Read, name: "writeEnableLatch");
             configurationRegister = new WordRegister(this);
+            if(useStatusRegisterStubs)
+            {
+                // Most flash devices implement custom status registers with device-specific behavior.
+                // In most cases, a stubbed read-write implementation is sufficient for emulation.
+                statusRegister.WithValueField(2, 6, name: "STATUS");
+                configurationRegister.WithValueField(0, 16, name: "CONFIGURATION");
+            }
             flagStatusRegister = new ByteRegister(this)
                 .WithEnumField<ByteRegister, AddressingMode>(0, 1, FieldMode.Read, valueProviderCallback: _ => addressingMode.Value, name: "Addressing")
                 //other bits indicate either protection errors (not implemented) or pending operations (they already finished)
@@ -65,13 +73,7 @@ namespace Antmicro.Renode.Peripherals.SPI
             this.deviceConfiguration = deviceConfiguration;
 
             deviceData = GetDeviceData();
-
-            SFDPSignature = (new SFDP(
-                new Dictionary<uint, SFDPParameter>
-                {
-                    [0x18] = new JEDECParameter(4.KB(), underlyingMemory.Size, 256, (byte)Commands.SubsectorErase4kb)
-                }
-            )).Bytes;
+            PrepareSFDPSignature();
         }
 
         public void OnGPIO(int number, bool value)
@@ -155,6 +157,40 @@ namespace Antmicro.Renode.Peripherals.SPI
 
         public byte[] SFDPSignature { get; set; }
 
+        protected virtual void PrepareSFDPSignature()
+        {
+            var jedecParameter = new JedecParameter(4.KB(), underlyingMemory.Size, 256, (byte)Commands.SubsectorErase4kb);
+
+            jedecParameter.JedecPacket.Supports1s1s2s = true;
+            jedecParameter.JedecPacket.NumberOfWaitStates1s1s2s = 4;
+            jedecParameter.JedecPacket.NumberOfModeClocks1s1s2s = 0;
+            // industry standard, according to JEDEC spec
+            jedecParameter.JedecPacket.Read1s2s2sCode = (uint)Commands.DualOutputFastRead;
+
+            jedecParameter.JedecPacket.Supports1s2s2s = true;
+            jedecParameter.JedecPacket.NumberOfWaitStates1s2s2s = 4;
+            jedecParameter.JedecPacket.NumberOfModeClocks1s2s2s = 0;
+            jedecParameter.JedecPacket.Read1s2s2sCode = (uint)Commands.DualInputOutputFastRead;
+
+            jedecParameter.JedecPacket.Supports1s4s4s = true;
+            jedecParameter.JedecPacket.NumberOfWaitStates1s4s4s = 4;
+            jedecParameter.JedecPacket.NumberOfModeClocks1s4s4s = 2;
+            jedecParameter.JedecPacket.Read1s4s4sCode = (uint)Commands.QuadInputOutputFastRead;
+
+            jedecParameter.JedecPacket.Supports1s1s4s = true;
+            jedecParameter.JedecPacket.NumberOfWaitStates1s1s4s = 8;
+            jedecParameter.JedecPacket.NumberOfModeClocks1s1s4s = 0;
+            jedecParameter.JedecPacket.Read1s1s4sCode = (uint)Commands.QuadOutputFastRead;
+
+            // 6.4.18 JEDEC Basic Flash Parameter Table: 15th DWORD
+            // QE is bit 6 of Status Register 1
+            jedecParameter.JedecPacket.QuadEnableRequirements = 0b10;
+
+            SFDPSignature = (new SFDPData(
+                    new KeyValuePair<uint, JedecParameter>(0x18u, jedecParameter)
+            )).Bytes;
+        }
+
         protected virtual byte ReadFromMemory()
         {
             var memoryAddress = (long)currentOperation.ExecutionAddress + currentOperation.CommandBytesHandled;
@@ -224,6 +260,16 @@ namespace Antmicro.Renode.Peripherals.SPI
             switch(command)
             {
             case Commands.FastRead:
+            case Commands.FastRead4byte:
+            case Commands.DualInputOutputFastRead:
+            case Commands.DualInputOutputFastRead4byte:
+            case Commands.DualOutputFastRead:
+            case Commands.DualOutputFastRead4byte:
+            case Commands.QuadOutputFastRead:
+            case Commands.QuadOutputFastRead4byte:
+            case Commands.QuadInputOutputFastRead:
+            case Commands.QuadInputOutputFastRead4byte:
+            case Commands.QuadInputOutputWordRead:
             case Commands.ReadSerialFlashDiscoveryParameter:
                 return 1;
             default:
@@ -248,9 +294,9 @@ namespace Antmicro.Renode.Peripherals.SPI
                 currentOperation.AddressLength = 3;
                 break;
             case (byte)Commands.FastRead:
-                // fast read - 3 bytes of address + a dummy byte
+                // fast read - 3 or 4 bytes of address (depending on mode) + a dummy byte
                 currentOperation.Operation = DecodedOperation.OperationType.ReadFast;
-                currentOperation.AddressLength = 3;
+                currentOperation.AddressLength = NumberOfAddressBytes;
                 currentOperation.State = DecodedOperation.OperationState.AccumulateCommandAddressBytes;
                 break;
             case (byte)Commands.Read:
@@ -292,6 +338,7 @@ namespace Antmicro.Renode.Peripherals.SPI
                 break;
             case (byte)Commands.PageProgram4byte:
             case (byte)Commands.QuadInputFastProgram4byte:
+            case (byte)Commands.QuadInputExtendedFastProgram4byte:
                 currentOperation.Operation = DecodedOperation.OperationType.Program;
                 currentOperation.AddressLength = 4;
                 currentOperation.State = DecodedOperation.OperationState.AccumulateCommandAddressBytes;

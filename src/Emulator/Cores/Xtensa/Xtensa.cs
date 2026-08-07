@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2010-2025 Antmicro
+// Copyright (c) 2010-2026 Antmicro
 //
 // This file is licensed under the MIT License.
 // Full license text is available in 'licenses/MIT.txt'.
@@ -19,9 +19,9 @@ using Endianess = ELFSharp.ELF.Endianess;
 
 namespace Antmicro.Renode.Peripherals.CPU
 {
-    public partial class Xtensa : TranslationCPU, IPeripheralRegister<SemihostingUart, NullRegistrationPoint>
+    public partial class Xtensa : TranslationCPU, IRegisterablePeripheral<SemihostingUart, NullRegistrationPoint>
     {
-        public Xtensa(string cpuType, IMachine machine, uint cpuId = 0, long frequency = 10000000)
+        public Xtensa(string cpuType, IMachine machine, uint cpuId = 0, ulong frequency = 10000000)
                 : base(cpuId, cpuType, machine, Endianess.LittleEndian)
         {
             innerTimers = new ComparingTimer[InnerTimersCount];
@@ -62,6 +62,8 @@ namespace Antmicro.Renode.Peripherals.CPU
             machine.UnregisterAsAChildOf(this, peripheral);
         }
 
+        public override string GetLLVMTriple(uint flags) => AllLLVMTriples[0];
+
         public override string Architecture { get { return "xtensa"; } }
 
         public override ExecutionMode ExecutionMode
@@ -81,6 +83,12 @@ namespace Antmicro.Renode.Peripherals.CPU
         public override string GDBArchitecture { get { return "xtensa"; } }
 
         public override List<GDBFeatureDescriptor> GDBFeatures => new List<GDBFeatureDescriptor>();
+
+        public override string[] AllLLVMTriples => new[] { "xtensa" };
+
+        public override string LLVMModel => Model == "sample_controller" ? "mocked-sample-controller" : Model;
+
+        public override Endianess DisassemblyHexFormatting => Endianess.BigEndian;
 
         protected override Interrupt DecodeInterrupt(int number)
         {

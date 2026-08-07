@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2010-2025 Antmicro
+// Copyright (c) 2010-2026 Antmicro
 //
 // This file is licensed under the MIT License.
 // Full license text is available in 'licenses/MIT.txt'.
@@ -7,6 +7,8 @@
 using System;
 using System.Collections.Generic;
 using System.Globalization;
+
+using Antmicro.Renode.Exceptions;
 
 namespace Antmicro.Renode.Utilities.RESD
 {
@@ -139,6 +141,27 @@ namespace Antmicro.Renode.Utilities.RESD
     [SampleType(SampleType.Voltage)]
     public class VoltageSample : RESDSample
     {
+        public VoltageSample()
+        {
+        }
+
+        public VoltageSample(uint microVolts)
+        {
+            this.voltage = microVolts;
+        }
+
+        public VoltageSample(decimal volts)
+        {
+            try
+            {
+                this.voltage = (uint)(volts * 1e6m);
+            }
+            catch(OverflowException)
+            {
+                throw new RecoverableException($"{volts} is too big to be converted to µV");
+            }
+        }
+
         public override bool TryReadFromStream(SafeBinaryReader reader)
         {
             return reader.TryReadUInt32(out voltage);
@@ -289,6 +312,26 @@ namespace Antmicro.Renode.Utilities.RESD
         private const int LengthSize = 4;
     }
 
+    [SampleType(SampleType.Illuminance)]
+    public class IlluminanceSample : RESDSample
+    {
+        public override bool TryReadFromStream(SafeBinaryReader reader)
+        {
+            return reader.TryReadUInt32(out illuminance);
+        }
+
+        public override string ToString()
+        {
+            return $"{DecimalToString(Illuminance / 1e3m)} lx";
+        }
+
+        public override int? Width => 4;
+
+        public uint Illuminance => illuminance;
+
+        private uint illuminance;
+    }
+
     public class SampleTypeAttribute : Attribute
     {
         public SampleTypeAttribute(SampleType sampleType)
@@ -311,6 +354,7 @@ namespace Antmicro.Renode.Utilities.RESD
         Pressure = 0x0007,
         MagneticFluxDensity = 0x0008,
         BinaryData = 0x0009,
+        Illuminance = 0x000a,
 
         // Custom sample types
         Custom = 0xF000,

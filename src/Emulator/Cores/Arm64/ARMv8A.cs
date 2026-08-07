@@ -19,7 +19,7 @@ using Endianess = ELFSharp.ELF.Endianess;
 
 namespace Antmicro.Renode.Peripherals.CPU
 {
-    public partial class ARMv8A : BaseARMv8, IARMTwoSecurityStatesCPU, IPeripheralRegister<ARM_GenericTimer, NullRegistrationPoint>
+    public partial class ARMv8A : BaseARMv8, IARMTwoSecurityStatesCPU, IRegisterablePeripheral<ARM_GenericTimer, NullRegistrationPoint>
     {
         public ARMv8A(IMachine machine, string cpuType, ARM_GenericInterruptController genericInterruptController, uint cpuId = 0, Endianess endianness = Endianess.LittleEndian)
                 : base(cpuId, cpuType, machine, endianness)
@@ -88,6 +88,19 @@ namespace Antmicro.Renode.Peripherals.CPU
             machine.UnregisterAsAChildOf(this, peripheral);
         }
 
+        public override string GetLLVMTriple(uint flags)
+        {
+            if(flags == 0b11)
+            {
+                return AllLLVMTriples[2];
+            }
+            if(flags == 0b10)
+            {
+                return AllLLVMTriples[1];
+            }
+            return AllLLVMTriples[0];
+        }
+
         public override string Architecture { get { return "arm64"; } }
 
         public override string GDBArchitecture { get { return "aarch64"; } }
@@ -121,6 +134,10 @@ namespace Antmicro.Renode.Peripherals.CPU
                 return features;
             }
         }
+
+        public override string[] AllLLVMTriples => new[] { "arm64", "armv8a", "thumb" };
+
+        public override string LLVMModel => Model;
 
         public ExceptionLevel ExceptionLevel
         {

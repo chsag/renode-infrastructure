@@ -1,10 +1,9 @@
 //
-// Copyright (c) 2010-2025 Antmicro
+// Copyright (c) 2010-2026 Antmicro
 //
 // This file is licensed under the MIT License.
 // Full license text is available in 'licenses/MIT.txt'.
 //
-#if !PLATFORM_WINDOWS
 using System;
 using System.ComponentModel;
 using System.Diagnostics;
@@ -20,8 +19,11 @@ namespace Antmicro.Renode.UI
     public abstract class ProcessBasedProvider : IConsoleBackendAnalyzerProvider
     {
         // isMonitorWindows is not used for ProcessBasedProvider
-        public bool TryOpen(string consoleName, out IIOSource io, bool isMonitorWindow = false)
+        public bool TryOpen(string consoleName, out IIOSource io, out ISizeSource size, bool isMonitorWindow = false)
         {
+            // We can't learn the size of the terminal through screen
+            size = null;
+
             var ptyUnixStream = new PtyUnixStream();
             io = new StreamIOSource(ptyUnixStream);
 
@@ -125,5 +127,3 @@ namespace Antmicro.Renode.UI
         private const string ScreenTool = "screen";
     }
 }
-
-#endif

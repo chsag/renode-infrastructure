@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2010-2025 Antmicro
+// Copyright (c) 2010-2026 Antmicro
 // Copyright (c) 2011-2015 Realtime Embedded
 //
 // This file is licensed under the MIT License.
@@ -56,7 +56,7 @@ namespace Antmicro.Renode.UI
 
         public void Show()
         {
-            var availableProviders = TypeManager.Instance.AutoLoadedTypes.Where(x => !x.IsAbstract && typeof(IConsoleBackendAnalyzerProvider).IsAssignableFrom(x)).ToDictionary(x => GetProviderName(x), x => x);
+            var availableProviders = TypeManager.Instance.AutoLoadedTypes.Where(x => !x.IsAbstract && typeof(IConsoleBackendAnalyzerProvider).IsAssignableFrom(x) && x.IsRIDSupported()).ToDictionary(x => GetProviderName(x), x => x);
             var preferredProvider = ConfigurationManager.Instance.Get("general", "terminal", "XTerm");
 
             foreach(var providerName in availableProviders.Keys.OrderByDescending(x => x == preferredProvider))
@@ -69,12 +69,13 @@ namespace Antmicro.Renode.UI
                 }
                 provider = (IConsoleBackendAnalyzerProvider)Activator.CreateInstance(availableProviders[providerName]);
                 provider.OnClose += OnClose;
-                if(!provider.TryOpen(Name, out IIOSource ioSource, isMonitorWindow))
+                if(!provider.TryOpen(Name, out var ioSource, out var sizeSource, isMonitorWindow))
                 {
                     Logger.Log(LogLevel.Warning, "Could not open {0} console backend analyzer provider. Trying the next one.", providerName);
                     continue;
                 }
                 IO.Backend = ioSource;
+                SizeSource = sizeSource;
                 if(Backend != null)
                 {
                     ((UARTBackend)Backend).BindAnalyzer(IO);
@@ -120,6 +121,8 @@ namespace Antmicro.Renode.UI
         public IAnalyzableBackend Backend { get; private set; }
 
         public IOProvider IO { get; private set; }
+
+        public ISizeSource SizeSource { get; private set; }
 
         public event Action Quitted;
 

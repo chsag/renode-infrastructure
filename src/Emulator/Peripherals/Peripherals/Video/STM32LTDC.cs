@@ -1,13 +1,10 @@
 //
-// Copyright (c) 2010-2025 Antmicro
+// Copyright (c) 2010-2026 Antmicro
 // Copyright (c) 2020-2021 Microsoft
 //
 // This file is licensed under the MIT License.
 // Full license text is available in 'licenses/MIT.txt'.
 //
-
-using System;
-using System.Collections.Generic;
 
 using Antmicro.Migrant;
 using Antmicro.Migrant.Hooks;
@@ -21,7 +18,7 @@ using Antmicro.Renode.Utilities;
 
 namespace Antmicro.Renode.Peripherals.Video
 {
-    public class STM32LTDC : AutoRepaintingVideo, IDoubleWordPeripheral, IKnownSize
+    public class STM32LTDC : AutoRepaintingVideo, IDoubleWordPeripheral, IKnownSize, IProvidesRegisterCollection<DoubleWordRegisterCollection>
     {
         public STM32LTDC(IMachine machine) : base(machine)
         {
@@ -29,35 +26,37 @@ namespace Antmicro.Renode.Peripherals.Video
 
             IRQ = new GPIO();
             ErrorIRQ = new GPIO();
+            RegistersCollection = new DoubleWordRegisterCollection(this);
             interruptManager = new InterruptManager<Events>(this);
 
             sysbus = machine.GetSystemBus(this);
             internalLock = new object();
+            localLayerBuffer = new byte[2][];
 
             // We don't care about the sync, back porch, or front porch pixels, but since the registers specify sums of pixel areas, we need the back porch sum and active sum registers to find the width and height. We're providing the other registers to silence warnings.
-            var syncronizationSizeConfigurationRegister = new DoubleWordRegister(this)
+            Register.SyncronizationSizeConfigurationRegister.Define(this)
                 .WithValueField(0, 10, name: "VSH")
                 .WithReservedBits(11, 5)
                 .WithValueField(16, 11, name: "HSW")
                 .WithReservedBits(28, 4);
 
-            var backPorchConfigurationRegister = new DoubleWordRegister(this)
+            Register.BackPorchConfigurationRegister.Define(this)
                 .WithValueField(0, 11, out accumulatedVerticalBackPorchField, name: "AVBP")
                 .WithReservedBits(11, 5)
                 .WithValueField(16, 12, out accumulatedHorizontalBackPorchField, name: "AHBP", writeCallback: (_, __) => HandleActiveDisplayChange())
                 .WithReservedBits(28, 4);
 
-            var activeWidthConfigurationRegister = new DoubleWordRegister(this)
+            Register.ActiveWidthConfigurationRegister.Define(this)
                 .WithValueField(0, 11, out accumulatedActiveHeightField, name: "AAH")
                 .WithReservedBits(11, 5)
                 .WithValueField(16, 12, out accumulatedActiveWidthField, name: "AAW", writeCallback: (_, __) => HandleActiveDisplayChange())
                 .WithReservedBits(28, 4);
 
-            var totalWidthConfigurationRegister = new DoubleWordRegister(this)
+            Register.TotalWidthConfigurationRegister.Define(this)
                 .WithValueField(0, 10, name: "TOTALH")
                 .WithValueField(16, 11, name: "TOTALW");
 
-            var globalControlRegister = new DoubleWordRegister(this, resetValue: 0x2220)
+            Register.GlobalControlRegister.Define(this, resetValue: 0x2220)
                 .WithFlag(0, out ltdcEnabledField, name: "LTDCEN")
                 .WithReservedBits(1, 3)
                 .WithTag("DBW", 4, 3)
@@ -73,81 +72,47 @@ namespace Antmicro.Renode.Peripherals.Video
                 .WithTaggedFlag("VSPOL", 30)
                 .WithTaggedFlag("HSPOL", 31);
 
-            var shadowReloadRegister = new DoubleWordRegister(this)
+            Register.ShadowReloadConfigurationRegister.Define(this)
                 .WithFlag(0, FieldMode.Read | FieldMode.WriteOneToClear, name: "IMR", writeCallback: (_, @new) =>
                 {
-                    if (!@new) return;
-                    ReloadShadowRegisters();
+                    if(!@new) return;
+                    RegistersCollection.ShadowReload();
                 })
-                .WithFlag(1, out verticalBlankingReload,FieldMode.Read | FieldMode.WriteToSet, name: "VBR")
+                .WithFlag(1, out verticalBlankingReload, FieldMode.Read | FieldMode.WriteToSet, name: "VBR")
                 .WithReservedBits(2, 30);
 
-            var backgroundColorConfigurationRegister = new DoubleWordRegister(this)
+            Register.BackgroundColorConfigurationRegister.Define(this)
                 .WithValueField(0, 8, out backgroundColorBlueChannelField, name: "BCBLUE")
                 .WithValueField(8, 8, out backgroundColorGreenChannelField, name: "BCGREEN")
                 .WithValueField(16, 8, out backgroundColorRedChannelField, name: "BCRED", writeCallback: (_, __) => HandleBackgroundColorChange());
 
-            var interruptEnableRegister = interruptManager.GetInterruptEnableRegister<DoubleWordRegister>();
-            var interruptStatusRegister = interruptManager.GetMaskedInterruptFlagRegister<DoubleWordRegister>();
-            var interruptClearRegister = interruptManager.GetInterruptClearRegister<DoubleWordRegister>();
+            RegistersCollection.AddRegister((long)Register.InterruptEnableRegister, interruptManager.GetInterruptEnableRegister<DoubleWordRegister>());
+            RegistersCollection.AddRegister((long)Register.InterruptStatusRegister, interruptManager.GetRawInterruptFlagRegister<DoubleWordRegister>());
+            RegistersCollection.AddRegister((long)Register.InterruptClearRegister, interruptManager.GetInterruptClearRegister<DoubleWordRegister>());
 
-            lineInterruptPositionConfigurationRegister = new DoubleWordRegister(this).WithValueField(0, 11, name: "LIPOS");
+            Register.LineInterruptPositionConfigurationRegister.Define(this)
+                .WithValueField(0, 11, name: "LIPOS");
 
-            var registerMappings = new Dictionary<long, DoubleWordRegister>
-            {
-                { (long)Register.SyncronizationSizeConfigurationRegister, syncronizationSizeConfigurationRegister },
-                { (long)Register.TotalWidthConfigurationRegister, totalWidthConfigurationRegister },
-                { (long)Register.BackPorchConfigurationRegister, backPorchConfigurationRegister },
-                { (long)Register.ActiveWidthConfigurationRegister, activeWidthConfigurationRegister },
-                { (long)Register.GlobalControlRegister, globalControlRegister },
-                { (long)Register.ShadowReloadConfigurationRegister, shadowReloadRegister },
-                { (long)Register.BackgroundColorConfigurationRegister, backgroundColorConfigurationRegister },
-                { (long)Register.InterruptEnableRegister, interruptEnableRegister },
-                { (long)Register.InterruptStatusRegister, interruptStatusRegister },
-                { (long)Register.InterruptClearRegister, interruptClearRegister },
-                { (long)Register.LineInterruptPositionConfigurationRegister, lineInterruptPositionConfigurationRegister }
-            };
+            layer = new Layer[] { new Layer(this, 0), new Layer(this, 1) };
 
-            localLayerBuffer = new byte[2][];
-            layer = new Layer[2];
-            for(var i = 0; i < layer.Length; i++)
-            {
-                layer[i] = new Layer(this, i);
-
-                var offset = 0x80 * i;
-                registerMappings.Add(0x84 + offset, layer[i].ControlRegister);
-                registerMappings.Add(0x88 + offset, layer[i].WindowHorizontalPositionConfigurationRegister);
-                registerMappings.Add(0x8C + offset, layer[i].WindowVerticalPositionConfigurationRegister);
-                registerMappings.Add(0x90 + offset, layer[i].ColorKeyingConfigurationRegister);
-                registerMappings.Add(0x94 + offset, layer[i].PixelFormatConfigurationRegister);
-                registerMappings.Add(0x98 + offset, layer[i].ConstantAlphaConfigurationRegister);
-                registerMappings.Add(0x9C + offset, layer[i].DefaultColorConfigurationRegister);
-                registerMappings.Add(0xA0 + offset, layer[i].BlendingFactorConfigurationRegister);
-                registerMappings.Add(0xAC + offset, layer[i].ColorFrameBufferAddressRegister);
-                registerMappings.Add(0xB0 + offset, layer[i].ColorFrameBufferLengthRegister);
-                registerMappings.Add(0xB4 + offset, layer[i].ColorFrameBufferLineNumberRegister);
-                registerMappings.Add(0xC4 + offset, layer[i].CLUTWriteRegister);
-            }
-
-            registers = new DoubleWordRegisterCollection(this, registerMappings);
-            registers.Reset();
+            RegistersCollection.Reset();
             HandlePixelFormatChange();
         }
 
         public override void Reset()
         {
-            registers.Reset();
+            RegistersCollection.Reset();
             interruptManager.Reset();
         }
 
         public void WriteDoubleWord(long address, uint value)
         {
-            registers.Write(address, value);
+            RegistersCollection.Write(address, value);
         }
 
         public uint ReadDoubleWord(long offset)
         {
-            return registers.Read(offset);
+            return RegistersCollection.Read(offset);
         }
 
         [IrqProvider]
@@ -158,6 +123,8 @@ namespace Antmicro.Renode.Peripherals.Video
         public GPIO ErrorIRQ { get; private set; }
 
         public long Size { get { return 0xC00; } }
+
+        public DoubleWordRegisterCollection RegistersCollection { get; private set; }
 
         protected override void Repaint()
         {
@@ -170,9 +137,9 @@ namespace Antmicro.Renode.Peripherals.Video
 
                 for(var i = 0; i < 2; i++)
                 {
-                    if(layer[i].LayerEnableFlag.Value && layer[i].ColorFrameBufferAddressRegister.Value != 0)
+                    if(layer[i].LayerEnableFlag.ShadowValue && layer[i].ColorFrameBufferAddressField.ShadowValue != 0)
                     {
-                        var providedBufferLength = (int)(layer[i].BufferLineLength.Value * layer[i].BufferLineNumber.Value);
+                        var providedBufferLength = (int)(layer[i].BufferLineLength.ShadowValue * layer[i].BufferLineNumber.ShadowValue);
                         var bufferLength = layer[i].LayerBuffer.Length;
 
                         if(providedBufferLength < bufferLength)
@@ -183,7 +150,7 @@ namespace Antmicro.Renode.Peripherals.Video
                         }
                         // Excess buffer data is discarded, no need to check
 
-                        sysbus.ReadBytes(layer[i].ColorFrameBufferAddressRegister.Value, bufferLength, layer[i].LayerBuffer, 0);
+                        sysbus.ReadBytes(layer[i].ColorFrameBufferAddressField.ShadowValue, bufferLength, layer[i].LayerBuffer, 0);
                         localLayerBuffer[i] = layer[i].LayerBuffer;
                     }
                     else
@@ -204,7 +171,7 @@ namespace Antmicro.Renode.Peripherals.Video
                 if(verticalBlankingReload.Value)
                 {
                     verticalBlankingReload.Value = false;
-                    ReloadShadowRegisters();
+                    RegistersCollection.ShadowReload();
                     interruptManager.SetInterrupt(Events.RegisterReload);
                 }
             }
@@ -246,14 +213,6 @@ namespace Antmicro.Renode.Peripherals.Video
             }
         }
 
-        private void ReloadShadowRegisters()
-        {
-            for(var idx = 0; idx < 2; idx += 1)
-            {
-                layer[idx].ReloadShadowRegisters();
-            }
-        }
-
         [Transient]
         private IPixelBlender blender;
         private Pixel backgroundColor;
@@ -271,9 +230,7 @@ namespace Antmicro.Renode.Peripherals.Video
         private readonly IValueRegisterField backgroundColorBlueChannelField;
         private readonly IValueRegisterField backgroundColorGreenChannelField;
         private readonly IValueRegisterField backgroundColorRedChannelField;
-        private readonly DoubleWordRegister lineInterruptPositionConfigurationRegister;
         private readonly Layer[] layer;
-        private readonly DoubleWordRegisterCollection registers;
 
         private readonly object internalLock;
         private readonly IBusController sysbus;
@@ -282,66 +239,68 @@ namespace Antmicro.Renode.Peripherals.Video
         {
             public Layer(STM32LTDC video, int layerId)
             {
-                ControlRegister = new DoubleWordRegister(video);
-                LayerEnableFlag = new ShadowedRegisterField<bool>(ControlRegister.DefineFlagField(0, name: "LEN"), writeCallback: (_, __) => WarnAboutWrongBufferConfiguration());
-                ControlRegister
+                var coll = video.RegistersCollection;
+                var offset = layerId * 0x80 + 0x80;
+
+                coll.DefineRegister(offset + (long)Register.Control)
+                    .WithFlag(0, out LayerEnableFlag, name: "LEN", shadowReloadCallback: (_, __) => WarnAboutWrongBufferConfiguration())
                     .WithTaggedFlag("COLKEN", 1)
                     .WithReservedBits(2, 2)
                     .WithTaggedFlag("CLUTEN", 4)
                     .WithReservedBits(5, 27);
 
-                WindowHorizontalPositionConfigurationRegister = new DoubleWordRegister(video);
-                WindowHorizontalStartPositionField = new ShadowedRegisterField<ulong>(WindowHorizontalPositionConfigurationRegister.DefineValueField(0, 12, name: "WHSTPOS"));
-                WindowHorizontalPositionConfigurationRegister.WithReservedBits(12, 4);
-                WindowHorizontalStopPositionField = new ShadowedRegisterField<ulong>(WindowHorizontalPositionConfigurationRegister.DefineValueField(16, 12, name: "WHSPPOS"), writeCallback: (_, __) => HandleLayerWindowConfigurationChange());
-                WindowHorizontalPositionConfigurationRegister.WithReservedBits(28, 4);
+                coll.DefineRegister(offset + (long)Register.WindowHorizontalPositionConfigurationRegister)
+                    .WithValueField(0, 12, out WindowHorizontalStartPositionField, name: "WHSTPOS")
+                    .WithReservedBits(12, 4)
+                    .WithValueField(16, 12, out WindowHorizontalStopPositionField, name: "WHPPOS", shadowReloadCallback: (_, __) => HandleLayerWindowConfigurationChange())
+                    .WithReservedBits(28, 4);
 
-                WindowVerticalPositionConfigurationRegister = new DoubleWordRegister(video);
-                WindowVerticalStartPositionField = new ShadowedRegisterField<ulong>(WindowVerticalPositionConfigurationRegister.DefineValueField(0, 12, name: "WVSTPOS"));
-                WindowVerticalPositionConfigurationRegister.WithReservedBits(12, 4);
-                WindowVerticalStopPositionField = new ShadowedRegisterField<ulong>(WindowVerticalPositionConfigurationRegister.DefineValueField(16, 12, name: "WVSPPOS", writeCallback: (_, __) => HandleLayerWindowConfigurationChange()));
-                WindowVerticalPositionConfigurationRegister.WithReservedBits(28, 4);
+                coll.DefineRegister(offset + (long)Register.WindowVerticalPositionConfigurationRegister)
+                    .WithValueField(0, 12, out WindowVerticalStartPositionField, name: "WVSTPOS")
+                    .WithReservedBits(12, 4)
+                    .WithValueField(16, 12, out WindowVerticalStopPositionField, name: "WVSPPOS", shadowReloadCallback: (_, __) => HandleLayerWindowConfigurationChange())
+                    .WithReservedBits(28, 4);
 
-                ColorKeyingConfigurationRegister = new DoubleWordRegister(video)
+                coll.DefineRegister(offset + (long)Register.ColorKeyingConfigurationRegister)
                     .WithTag("CKBLUE", 0, 8)
                     .WithTag("CKGREEN", 8, 8)
                     .WithTag("CKGREEN", 16, 8)
                     .WithReservedBits(24, 8);
 
-                PixelFormatConfigurationRegister = new DoubleWordRegister(video);
-                PixelFormatField = new ShadowedRegisterField<Dma2DColorMode>(PixelFormatConfigurationRegister.DefineEnumField<Dma2DColorMode>(0, 3, name: "PF"), writeCallback: (old, @new) => { if(old == @new) return; RestoreBuffers(); video.HandlePixelFormatChange(); });
-                PixelFormatConfigurationRegister.WithReservedBits(3, 29);
+                coll.DefineRegister(offset + (long)Register.PixelFormatConfigurationRegister)
+                    .WithEnumField(0, 3, out PixelFormatField, name: "PF", shadowReloadCallback: (old, @new) => { if(old == @new) return; RestoreBuffers(); video.HandlePixelFormatChange(); })
+                    .WithReservedBits(3, 29);
 
-                ConstantAlphaConfigurationRegister = new DoubleWordRegister(video, 0xFF);
-                ConstantAlphaConfigurationField = new ShadowedRegisterField<ulong>(ConstantAlphaConfigurationRegister.DefineValueField(0, 8, name: "CONSTA"));
-                ConstantAlphaConfigurationRegister.WithReservedBits(8, 24);
+                coll.DefineRegister(offset + (long)Register.ConstantAlphaConfigurationRegister, 0xFF)
+                    .WithValueField(0, 8, out ConstantAlphaConfigurationField, name: "CONSTA")
+                    .WithReservedBits(8, 24);
 
-                BlendingFactorConfigurationRegister = new DoubleWordRegister(video, 0x0607);
-                BlendingFactor2 = new ShadowedRegisterField<BlendingFactor2>(BlendingFactorConfigurationRegister.DefineEnumField<BlendingFactor2>(0, 3, name: "BF2"));
-                BlendingFactorConfigurationRegister.WithReservedBits(3, 5);
-                BlendingFactor1 = new ShadowedRegisterField<BlendingFactor1>(BlendingFactorConfigurationRegister.DefineEnumField<BlendingFactor1>(8, 3, name: "BF1"));
-                BlendingFactorConfigurationRegister.WithReservedBits(11, 21);
+                coll.DefineRegister(offset + (long)Register.BlendingFactorConfigurationRegister, 0x0607)
+                    .WithEnumField(0, 3, out BlendingFactor2, name: "BF2")
+                    .WithReservedBits(3, 5)
+                    .WithEnumField(8, 3, out BlendingFactor1, name: "BF1")
+                    .WithReservedBits(11, 21);
 
-                ColorFrameBufferAddressRegister = new DoubleWordRegister(video);
-                ColorFrameBufferAddressField = new ShadowedRegisterField<ulong>(ColorFrameBufferAddressRegister.DefineValueField(0, 32, name: "CFBADD"), writeCallback: (_, __) => WarnAboutWrongBufferConfiguration());
+                coll.DefineRegister(offset + (long)Register.ColorFrameBufferAddressRegister)
+                    .WithValueField(0, 32, out ColorFrameBufferAddressField, name: "CFBADD", shadowReloadCallback: (_, __) => WarnAboutWrongBufferConfiguration());
 
-                DefaultColorConfigurationRegister = new DoubleWordRegister(video);
-                DefaultColorBlueField = new ShadowedRegisterField<ulong>(DefaultColorConfigurationRegister.DefineValueField(0, 8, name: "DCBLUE"));
-                DefaultColorGreenField = new ShadowedRegisterField<ulong>(DefaultColorConfigurationRegister.DefineValueField(8, 8, name: "DCGREEN"));
-                DefaultColorRedField = new ShadowedRegisterField<ulong>(DefaultColorConfigurationRegister.DefineValueField(16, 8, name: "DCRED"));
-                DefaultColorAlphaField = new ShadowedRegisterField<ulong>(DefaultColorConfigurationRegister.DefineValueField(24, 8, name: "DCALPHA"), writeCallback: (_, __) => HandleLayerBackgroundColorChange());
+                coll.DefineRegister(offset + (long)Register.DefaultColorConfigurationRegister)
+                    .WithValueField(0, 8, out DefaultColorBlueField, name: "DCBLUE")
+                    .WithValueField(8, 8, out DefaultColorGreenField, name: "DCGREEN")
+                    .WithValueField(16, 8, out DefaultColorRedField, name: "DCRED")
+                    .WithValueField(24, 8, out DefaultColorAlphaField, name: "DCALPHA");
 
-                ColorFrameBufferLengthRegister = new DoubleWordRegister(video);
-                BufferLineLength = new ShadowedRegisterField<ulong>(ColorFrameBufferLengthRegister.DefineValueField(0, 13, name: "CFBLL"));
-                ColorFrameBufferLengthRegister.WithReservedBits(13, 3);
-                BufferPitch = new ShadowedRegisterField<ulong>(ColorFrameBufferLengthRegister.DefineValueField(16, 13, name: "CFBP"));
-                ColorFrameBufferLengthRegister.WithReservedBits(29, 3);
+                coll.DefineRegister(offset + (long)Register.ColorFrameBufferLengthRegister)
+                    .WithValueField(0, 13, out BufferLineLength, name: "CFBLL")
+                    .WithReservedBits(13, 3)
+                    .WithValueField(16, 13, out BufferPitch, name: "CFBP")
+                    .WithReservedBits(29, 3);
 
-                ColorFrameBufferLineNumberRegister = new DoubleWordRegister(video);
-                BufferLineNumber = new ShadowedRegisterField<ulong>(ColorFrameBufferLineNumberRegister.DefineValueField(0, 11, name: "CFBLNBR"));
-                ColorFrameBufferLineNumberRegister.WithReservedBits(11, 21);
+                coll.DefineRegister(offset + (long)Register.ColorFrameBufferLineNumberRegister)
+                    .WithValueField(0, 11, out BufferLineNumber, name: "CFBLNBR")
+                    .WithReservedBits(11, 21);
 
-                CLUTWriteRegister = new DoubleWordRegister(video)
+                coll.DefineRegister(offset + (long)Register.CLUTWriteRegister)
                     .WithTag("BLUE", 0, 8)
                     .WithTag("GREEN", 8, 8)
                     .WithTag("RED", 16, 8)
@@ -351,84 +310,42 @@ namespace Antmicro.Renode.Peripherals.Video
                 this.video = video;
             }
 
-            public void ReloadShadowRegisters()
-            {
-                var valueRegisters = new ShadowedRegisterField<ulong>[] {
-                    DefaultColorAlphaField,
-                    DefaultColorRedField,
-                    DefaultColorGreenField,
-                    DefaultColorBlueField,
-                    WindowVerticalStartPositionField,
-                    WindowVerticalStopPositionField,
-                    WindowHorizontalStartPositionField,
-                    WindowHorizontalStopPositionField,
-                    ColorFrameBufferAddressField,
-                    BufferPitch,
-                    BufferLineLength,
-                    BufferLineNumber
-                };
-                foreach(var reg in valueRegisters)
-                {
-                    reg.Reload();
-                }
-                LayerEnableFlag.Reload();
-                BlendingFactor1.Reload();
-                BlendingFactor2.Reload();
-                PixelFormatField.Reload();
-            }
-
             public void RestoreBuffers()
             {
                 lock(video.internalLock)
                 {
-                    var layerPixelFormat = PixelFormatField.Value.ToPixelFormat();
-                    var colorDepth = layerPixelFormat.GetColorDepth();
-                    LayerBuffer = new byte[video.Width * video.Height * colorDepth];
+                    var layerPixelFormat = PixelFormatField.ShadowValue.ToPixelFormat();
+                    LayerBuffer = new byte[layerPixelFormat.GetByteCount((ulong)(video.Width * video.Height))];
                     LayerBackgroundBuffer = new byte[LayerBuffer.Length];
 
                     HandleLayerBackgroundColorChange();
                 }
             }
 
-            public DoubleWordRegister ControlRegister;
-            public ShadowedRegisterField<ulong> DefaultColorAlphaField;
-            public ShadowedRegisterField<ulong> DefaultColorRedField;
-            public ShadowedRegisterField<ulong> DefaultColorGreenField;
-            public ShadowedRegisterField<ulong> DefaultColorBlueField;
+            public IValueRegisterField DefaultColorAlphaField;
+            public IValueRegisterField DefaultColorRedField;
+            public IValueRegisterField DefaultColorGreenField;
+            public IValueRegisterField DefaultColorBlueField;
 
-            public DoubleWordRegister DefaultColorConfigurationRegister;
-            public ShadowedRegisterField<ulong> WindowVerticalStartPositionField;
-            public ShadowedRegisterField<ulong> WindowVerticalStopPositionField;
+            public IValueRegisterField WindowVerticalStartPositionField;
+            public IValueRegisterField WindowVerticalStopPositionField;
 
-            public DoubleWordRegister WindowVerticalPositionConfigurationRegister;
-            public ShadowedRegisterField<ulong> WindowHorizontalStartPositionField;
-            public ShadowedRegisterField<ulong> WindowHorizontalStopPositionField;
+            public IValueRegisterField WindowHorizontalStartPositionField;
+            public IValueRegisterField WindowHorizontalStopPositionField;
 
-            public DoubleWordRegister WindowHorizontalPositionConfigurationRegister;
+            public IValueRegisterField ColorFrameBufferAddressField;
+            public IEnumRegisterField<BlendingFactor2> BlendingFactor2;
+            public IEnumRegisterField<BlendingFactor1> BlendingFactor1;
 
-            public ShadowedRegisterField<ulong> ColorFrameBufferAddressField;
-            public DoubleWordRegister ColorFrameBufferAddressRegister;
-            public ShadowedRegisterField<BlendingFactor2> BlendingFactor2;
-            public ShadowedRegisterField<BlendingFactor1> BlendingFactor1;
-            public DoubleWordRegister BlendingFactorConfigurationRegister;
+            public IValueRegisterField ConstantAlphaConfigurationField;
+            public IEnumRegisterField<Dma2DColorMode> PixelFormatField;
 
-            public ShadowedRegisterField<ulong> ConstantAlphaConfigurationField;
-            public DoubleWordRegister ConstantAlphaConfigurationRegister;
-            public ShadowedRegisterField<Dma2DColorMode> PixelFormatField;
+            public IFlagRegisterField LayerEnableFlag;
 
-            public DoubleWordRegister ColorKeyingConfigurationRegister;
+            public IValueRegisterField BufferPitch;
+            public IValueRegisterField BufferLineLength;
 
-            public DoubleWordRegister PixelFormatConfigurationRegister;
-            public ShadowedRegisterField<bool> LayerEnableFlag;
-
-            public DoubleWordRegister ColorFrameBufferLengthRegister;
-            public ShadowedRegisterField<ulong> BufferPitch;
-            public ShadowedRegisterField<ulong> BufferLineLength;
-
-            public DoubleWordRegister ColorFrameBufferLineNumberRegister;
-            public ShadowedRegisterField<ulong> BufferLineNumber;
-
-            public DoubleWordRegister CLUTWriteRegister;
+            public IValueRegisterField BufferLineNumber;
 
             public byte[] LayerBuffer;
             public byte[] LayerBackgroundBuffer;
@@ -437,7 +354,7 @@ namespace Antmicro.Renode.Peripherals.Video
             {
                 lock(video.internalLock)
                 {
-                    if(LayerEnableFlag.Value && ColorFrameBufferAddressRegister.Value == 0)
+                    if(LayerEnableFlag.ShadowValue && ColorFrameBufferAddressField.ShadowValue == 0)
                     {
                         if(!warningAlreadyIssued)
                         {
@@ -456,10 +373,10 @@ namespace Antmicro.Renode.Peripherals.Video
             {
                 lock(video.internalLock)
                 {
-                    var width = (int)(WindowHorizontalStopPositionField.Value - WindowHorizontalStartPositionField.Value) + 1;
-                    var height = (int)(WindowVerticalStopPositionField.Value - WindowVerticalStartPositionField.Value) + 1;
+                    var width = (int)(WindowHorizontalStopPositionField.ShadowValue - WindowHorizontalStartPositionField.ShadowValue) + 1;
+                    var height = (int)(WindowVerticalStopPositionField.ShadowValue - WindowVerticalStartPositionField.ShadowValue) + 1;
 
-                    if(LayerEnableFlag.Value && (width != video.Width || height != video.Height))
+                    if(LayerEnableFlag.ShadowValue && (width != video.Width || height != video.Height))
                     {
                         video.Log(LogLevel.Warning, "Windowing is not supported yet for layer {0}.", layerId);
                     }
@@ -471,13 +388,13 @@ namespace Antmicro.Renode.Peripherals.Video
                 var colorBuffer = new byte[4 * video.Width * video.Height];
                 for(var i = 0; i < colorBuffer.Length; i += 4)
                 {
-                    colorBuffer[i] = (byte)DefaultColorAlphaField.Value;
-                    colorBuffer[i + 1] = (byte)DefaultColorRedField.Value;
-                    colorBuffer[i + 2] = (byte)DefaultColorGreenField.Value;
-                    colorBuffer[i + 3] = (byte)DefaultColorBlueField.Value;
+                    colorBuffer[i] = (byte)DefaultColorAlphaField.ShadowValue;
+                    colorBuffer[i + 1] = (byte)DefaultColorRedField.ShadowValue;
+                    colorBuffer[i + 2] = (byte)DefaultColorGreenField.ShadowValue;
+                    colorBuffer[i + 3] = (byte)DefaultColorBlueField.ShadowValue;
                 }
 
-                PixelManipulationTools.GetConverter(PixelFormat.ARGB8888, video.Endianess, PixelFormatField.Value.ToPixelFormat(), video.Endianess)
+                PixelManipulationTools.GetConverter(PixelFormat.ARGB8888, video.Endianess, PixelFormatField.ShadowValue.ToPixelFormat(), video.Endianess)
                     .Convert(colorBuffer, ref LayerBackgroundBuffer);
             }
 
@@ -485,29 +402,20 @@ namespace Antmicro.Renode.Peripherals.Video
             private readonly int layerId;
             private readonly STM32LTDC video;
 
-            public class ShadowedRegisterField<T>
+            private enum Register : long
             {
-                public ShadowedRegisterField(IRegisterField<T> field, Action<T, T> writeCallback = null)
-                {
-                    ShadowField = field;
-                    this.writeCallback = writeCallback;
-                }
-
-                public void Reload()
-                {
-                    var oldValue = Value;
-                    Value = ShadowField.Value;
-                    if(writeCallback != null)
-                    {
-                        this.writeCallback(oldValue, Value);
-                    }
-                }
-
-                public T Value { get; private set; }
-
-                public IRegisterField<T> ShadowField;
-
-                private readonly Action<T, T> writeCallback;
+                Control = 0x4,
+                WindowHorizontalPositionConfigurationRegister = 0x8,
+                WindowVerticalPositionConfigurationRegister = 0xC,
+                ColorKeyingConfigurationRegister = 0x10,
+                PixelFormatConfigurationRegister = 0x14,
+                ConstantAlphaConfigurationRegister = 0x18,
+                DefaultColorConfigurationRegister = 0x1C,
+                BlendingFactorConfigurationRegister = 0x20,
+                ColorFrameBufferAddressRegister = 0x2C,
+                ColorFrameBufferLengthRegister = 0x30,
+                ColorFrameBufferLineNumberRegister = 0x34,
+                CLUTWriteRegister = 0x44,
             }
         }
 

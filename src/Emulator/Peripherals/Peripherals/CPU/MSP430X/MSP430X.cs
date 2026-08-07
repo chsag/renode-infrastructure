@@ -25,7 +25,7 @@ using ELFSharp.ELF;
 
 namespace Antmicro.Renode.Peripherals.CPU
 {
-    public class MSP430X : BaseCPU, IGPIOReceiver, ICpuSupportingGdb
+    public class MSP430X : BaseCPU, IGPIOReceiver, ICpuSupportingGdb, ICPUSupportingLLVMDisas
     {
         public MSP430X(IMachine machine, string cpuType) : base(0, cpuType, machine, Endianess.LittleEndian)
         {
@@ -166,6 +166,11 @@ namespace Antmicro.Renode.Peripherals.CPU
             return Enumerable.Range(0, 16).Select(idx => new CPURegister(idx, 32, isGeneral: true, isReadonly: false));
         }
 
+        public IEnumerable<CPURegister> GetAllRegisters()
+        {
+            return GetRegisters();
+        }
+
         public void EnterSingleStepModeSafely(HaltArguments args)
         {
             ExecutionMode = ExecutionMode.SingleStep;
@@ -181,7 +186,7 @@ namespace Antmicro.Renode.Peripherals.CPU
             addr = addr ?? PC;
 
             var opcodes = Bus.ReadBytes(addr.Value, (int)blockSize, true, context: this);
-            disassembler.DisassembleBlock(addr.Value, opcodes, flags: 0, text: out var result);
+            disassembler.DisassembleBlock(addr.Value, opcodes, triple: null, alternateDialect: false, text: out var result);
             return result;
         }
 
@@ -192,7 +197,7 @@ namespace Antmicro.Renode.Peripherals.CPU
                 throw new RecoverableException("Assembler not available");
             }
 
-            var result = assembler.AssembleBlock(addr, instructions, flags: 0);
+            var result = assembler.AssembleBlock(addr, instructions, triple: null, alternateDialect: false);
             Bus.WriteBytes(result, addr, true, context: this);
             return (uint)result.Length;
         }
@@ -268,6 +273,8 @@ namespace Antmicro.Renode.Peripherals.CPU
             return ExecutionResult.Ok;
         }
 
+        public string GetLLVMTriple(uint flags) => AllLLVMTriples[0];
+
         public override string Architecture => "msp430x";
 
         public override RegisterValue PC { get; set; }
@@ -275,6 +282,12 @@ namespace Antmicro.Renode.Peripherals.CPU
         public override ulong ExecutedInstructions => executedInstructions;
 
         public string GDBArchitecture => "MSP430X";
+
+        public string[] AllLLVMTriples => new[] { "msp430" };
+
+        public string LLVMModel => Model;
+
+        public Endianess DisassemblyHexFormatting => Endianess.LittleEndian;
 
         public RegisterValue R13 { get; set; }
 

@@ -1,11 +1,12 @@
 //
-// Copyright (c) 2010-2025 Antmicro
+// Copyright (c) 2010-2026 Antmicro
 //
 // This file is licensed under the MIT License.
 // Full license text is available in 'licenses/MIT.txt'.
 //
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Linq;
 
 using Antmicro.Renode.Time;
@@ -119,7 +120,7 @@ namespace Antmicro.Renode.UserInterface.Commands
                     writer.WriteLine($"{TimeStampToTimeInterval(block.Duration)}");
                     break;
                 default:
-                    throw new Exception("unreachable");
+                    throw new UnreachableException();
                 }
             });
         }

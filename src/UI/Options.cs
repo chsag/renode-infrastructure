@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2010-2024 Antmicro
+// Copyright (c) 2010-2026 Antmicro
 // Copyright (c) 2011-2015 Realtime Embedded
 //
 // This file is licensed under the MIT License.
@@ -19,13 +19,21 @@ namespace Antmicro.Renode.UI
                 return false;
             }
 
-            if(DisableXwt)
+            if(UI)
+            {
+                if(Console)
+                {
+                    error = "--ui and --console cannot be set at the same time";
+                    return false;
+                }
+                ServerMode = true;
+            }
+            else if(DisableXwt)
             {
                 HideMonitor = true;
             }
 
-#if NET
-            if(ServerMode)
+            if(ServerMode && !UI)
             {
                 DisableXwt = true;
             }
@@ -34,13 +42,11 @@ namespace Antmicro.Renode.UI
                 error = "--server-mode-port and --server-mode-work-dir options are allowed only if --server-mode is enabled";
                 return false;
             }
-#else
-            if(ServerMode)
+            if(ServerMode && RobotDebug)
             {
-                error = "--server-mode is allowed only in .NET build";
+                error = "--server-mode (or --ui) and --robot-debug-on-error cannot be set at the same time";
                 return false;
             }
-#endif
 
             error = null;
             return true;
@@ -49,8 +55,8 @@ namespace Antmicro.Renode.UI
         [Name('p', "plain"), DefaultValue(false), Description("Remove steering codes (e.g., colours) from output.")]
         public bool Plain { get; set; }
 
-        [Name('P', "port"), DefaultValue(-1), Description("Instead of opening a window, listen for Monitor commands on the specified port.")]
-        public int Port { get; set; }
+        [Name('P', "port"), Description("Instead of opening a window, listen for Monitor commands on the specified port. Specify 0 to automatically assign an unused port. Specify -1 to disable both the port and the GUI monitor.")]
+        public int? Port { get; set; }
 
         [Name('e', "execute"), Description("Execute command on startup (executed after the optional script). May be used many times.")]
         public string[] Execute { get; set; }
@@ -58,8 +64,11 @@ namespace Antmicro.Renode.UI
         [Name("config"), Description("Use the configuration file from the provided path, or create one if it does not exist")]
         public string ConfigFile { get; set; }
 
-        [Name("disable-xwt"), Alias("disable-gui"), DefaultValue(false), Description("Disable XWT GUI support. It automatically sets HideMonitor.")]
+        [Alias("disable-xwt"), Name("disable-gui"), DefaultValue(false), Description("Disable GUI support. It automatically sets HideMonitor.")]
         public bool DisableXwt { get; set; }
+
+        [Name("ui"), DefaultValue(false), Description("Use the new Neutralino-based UI. Experimental!")]
+        public bool UI { get; set; }
 
         [Name("file-to-include / snapshot"), PositionalArgument(0)]
         public string FilePath { get; set; }
@@ -91,7 +100,7 @@ namespace Antmicro.Renode.UI
         [Name("keep-temporary-files"), Description("Don't clean temporary files on exit")]
         public bool KeepTemporaryFiles { get; set; }
 
-        [Name("server-mode"), DefaultValue(false), Description("Insted of opening a window. Expose localhost:port/proxy endpoint (Works only in .NET build)")]
+        [Name("server-mode"), DefaultValue(false), Description("Instead of opening a window, expose localhost:port/proxy endpoint")]
         public bool ServerMode { get; set; }
 
         [Name("server-mode-port"), DefaultValue(21234), Description("Set port for server mode")]

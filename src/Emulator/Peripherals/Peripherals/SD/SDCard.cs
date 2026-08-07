@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2010-2025 Antmicro
+// Copyright (c) 2010-2026 Antmicro
 // Copyright (c) 2011-2015 Realtime Embedded
 //
 // This file is licensed under the MIT License.
@@ -20,18 +20,21 @@ using static Antmicro.Renode.Utilities.BitHelper;
 
 namespace Antmicro.Renode.Peripherals.SD
 {
-    // Features NOT supported:
-    // * Toggling selected state
-    // * RCA (relative card address) filtering
+    // SD mode implements Spec v1.01; eMMC mode implements the minimal JESD84-B51 (eMMC v5.1) subset
+    // needed for identification, EXT_CSD access, and user/boot/RPMB hardware partition selection.
+    // SD Spec v1.01 features NOT supported:
+    // * The following commands: CMD4, CMD15, CMD27, CMD32, CMD33, CMD38, CMD56, ACMD6, ACMD22, ACMD23, ACMD42
+    // * Respect of selected state
+    // * RCA (relative card address) filtering other than CMD7
     // As a result any SD controller with more than one SD card attached at the same time might not work properly.
     // Card type (SC/HC/XC/UC) is determined based on the provided capacity
     public class SDCard : ISPIPeripheral, IDisposable
     {
-        public SDCard(long capacity, bool spiMode = false, BlockLength blockSize = BlockLength.Undefined)
-            : this(DataStorage.CreateInMemory((int)capacity), capacity, spiMode, blockSize) { }
+        public SDCard(long capacity, bool spiMode = false, BlockLength blockSize = BlockLength.Undefined, bool emmc = false)
+            : this(DataStorage.CreateInMemory((int)capacity), capacity, spiMode, blockSize, emmc) { }
 
-        public SDCard(string imageFile, long capacity, bool persistent = false, bool spiMode = false, BlockLength blockSize = BlockLength.Undefined, CompressionType compression = CompressionType.None)
-            : this(DataStorage.CreateFromFile(imageFile, capacity, persistent, compression: compression), capacity, spiMode, blockSize) { }
+        public SDCard(string imageFile, long capacity, bool persistent = false, bool spiMode = false, BlockLength blockSize = BlockLength.Undefined, CompressionType compression = CompressionType.None, bool emmc = false, string bootPartition0Image = null, string bootPartition1Image = null, long bootImageSize = 0)
+            : this(DataStorage.CreateFromFile(imageFile, capacity, persistent, compression: compression), capacity, spiMode, blockSize, emmc, persistent, bootPartition0Image, bootPartition1Image, bootImageSize) { }
 
         public void Reset()
         {
@@ -172,6 +175,9 @@ namespace Antmicro.Renode.Peripherals.SD
             return DummyByte;
         }
 
+        // XXX:
+        // Legacy SD EXT_CSD accessor, used only by `MPFS_SDController` (hacky non-eMMC path)
+        // eMMC hosts read EXT_CSD via CMD8 -> `emmcExtendedCsd` instead
         public byte[] ReadExtendedCardSpecificDataRegister()
         {
             return extendedCardSpecificDataGenerator.Bits.AsByteArray();
@@ -186,8 +192,8 @@ namespace Antmicro.Renode.Peripherals.SD
         {
             BitStream result;
             this.Log(LogLevel.Noisy, "Command received: 0x{0:x} with arg 0x{1:x}", commandIndex, arg);
-            var treatNextCommandAsAppCommandLocal = treatNextCommandAsAppCommand;
-            treatNextCommandAsAppCommand = false;
+            var treatNextCommandAsAppCommandLocal = TreatNextCommandAsAppCommand;
+            TreatNextCommandAsAppCommand = false;
             if(!treatNextCommandAsAppCommandLocal || !TryHandleApplicationSpecificCommand((SdCardApplicationSpecificCommand)commandIndex, arg, out result))
             {
                 result = HandleStandardCommand((SdCardCommand)commandIndex, arg);
@@ -199,21 +205,56 @@ namespace Antmicro.Renode.Peripherals.SD
         public void Dispose()
         {
             dataBackend.Dispose();
+            if(emmc)
+            {
+                bootPartitions[0].Dispose();
+                bootPartitions[1].Dispose();
+                rpmbPartition.Dispose();
+            }
         }
 
         public byte[] ReadData(uint size)
         {
             byte[] result;
+
+            if(sendingExtendedCsd)
+            {
+                result = new byte[size];
+                var available = Math.Max(0, emmcExtendedCsd.Length - emmcExtendedCsdOffset);
+                Array.Copy(emmcExtendedCsd, emmcExtendedCsdOffset, result, 0, Math.Min((int)size, available));
+                emmcExtendedCsdOffset += (int)size;
+                if(emmcExtendedCsdOffset >= emmcExtendedCsd.Length)
+                {
+                    sendingExtendedCsd = false;
+                    state = SDCardState.Transfer;
+                }
+                return result;
+            }
+
             if(readContext.Data != null)
             {
                 result = readContext.Data.AsByteArray(readContext.Offset, size);
                 Array.Reverse(result);
                 readContext.Move(size * 8);
+                // Requests with finite data automatically go to transfer state when finished
+                if(readContext.Offset >= readContext.Data.Length)
+                {
+                    state = SDCardState.Transfer;
+                    readContext.Data = null;
+                }
             }
             else
             {
                 result = ReadDataFromUnderlyingFile(readContext.Offset, checked((int)size));
                 readContext.Move(size);
+                // A block read ends back in Transfer state (JESD84-B51 section 6.6). The uSDHC reads
+                // the whole CMD17/18 at once then auto-stops (Auto CMD12, i.MX 8M Plus RM section
+                // 10.3.6), so no explicit CMD12 arrives; without returning to tran a following CMD6
+                // switch's CMD13 poll would time out. SPI streams per-block via spiContext.
+                if(!spiMode)
+                {
+                    state = SDCardState.Transfer;
+                }
             }
             return result;
         }
@@ -234,14 +275,49 @@ namespace Antmicro.Renode.Peripherals.SD
 
         public BitStream CardIdentification => cardIdentificationGenerator.Bits;
 
-        private SDCard(Stream dataBackend, long capacity, bool spiMode = false, BlockLength blockSize = BlockLength.Undefined)
+        public bool TreatNextCommandAsAppCommand { get; private set; }
+
+        // JESD84-B51 section 7.4
+        private static byte[] BuildExtendedCsd(long capacity, byte bootSizeMult)
         {
+            var extCsd = new byte[EmmcExtendedCsdLength];
+            var sectors = (uint)(capacity / 512);
+            extCsd[160] = 0x7;                       // PARTITIONING_SUPPORT [160] (7.4.85): partitioning + enhanced
+            extCsd[168] = EmmcRpmbSizeMult;          // RPMB_SIZE_MULT [168] (7.4.77), units of 128 KiB
+            extCsd[192] = 0x8;                       // EXT_CSD_REV [192] (7.4.61): 8 -> eMMC v5.1
+            extCsd[196] = (byte)EmmcDeviceType;      // DEVICE_TYPE [196] (7.4.59)
+            extCsd[212] = (byte)sectors;             // SEC_COUNT [215:212] (7.4.52), 512 B sectors
+            extCsd[213] = (byte)(sectors >> 8);
+            extCsd[214] = (byte)(sectors >> 16);
+            extCsd[215] = (byte)(sectors >> 24);
+            extCsd[221] = 0x1;                       // HC_WP_GRP_SIZE [221] (7.4.47)
+            extCsd[224] = 0x1;                       // HC_ERASE_GRP_SIZE [224] (7.4.44)
+            extCsd[226] = bootSizeMult;              // BOOT_SIZE_MULT [226] (7.4.42): boot part = value * 128 KiB
+            return extCsd;
+        }
+
+        private static Stream CreatePartitionStorage(string image, int size, bool persistent)
+        {
+            return image != null
+                ? DataStorage.CreateFromFile(image, size, persistent)
+                : DataStorage.CreateInMemory(size);
+        }
+
+        private SDCard(Stream dataBackend, long capacity, bool spiMode = false, BlockLength blockSize = BlockLength.Undefined, bool emmc = false, bool persistent = false, string bootPartition0Image = null, string bootPartition1Image = null, long bootImageSize = 0)
+        {
+            if(emmc && spiMode)
+            {
+                dataBackend.Dispose();
+                throw new ConstructionException("eMMC does not support SPI mode");
+            }
+
             var blockLenghtInBytes = SDHelpers.BlockLengthInBytes(blockSize);
             if((blockSize != BlockLength.Undefined) && (capacity % blockLenghtInBytes != 0))
             {
                 throw new ConstructionException($"Size (0x{capacity:X}) is not aligned to selected block size(0x{blockLenghtInBytes:X})");
             }
 
+            this.emmc = emmc;
             this.spiMode = spiMode;
             this.highCapacityMode = SDHelpers.TypeFromCapacity((ulong)capacity) != CardType.StandardCapacity_SC;
             this.capacity = capacity;
@@ -254,7 +330,9 @@ namespace Antmicro.Renode.Peripherals.SD
             blockLengthInBytes = SDHelpers.BlockLengthInBytes(sdCapacityParameters.BlockSize);
 
             cardStatusGenerator = new VariableLengthValue(32)
-                .DefineFragment(5, 1, () => (treatNextCommandAsAppCommand ? 1 : 0u), name: "APP_CMD bit")
+                .DefineFragment(5, 1, () => (TreatNextCommandAsAppCommand ? 1 : 0u), name: "APP_CMD bit")
+                // SWITCH_ERROR: JESD84-B51 Table 68, set on a bad CMD6 SWITCH
+                .DefineFragment(7, 1, () => (switchError ? 1u : 0u), name: "SWITCH_ERROR bit")
                 .DefineFragment(8, 1, 1, name: "READY_FOR_DATA bit")
                 .DefineFragment(9, 4, () => (uint)state, name: "CURRENT_STATE")
             ;
@@ -295,7 +373,7 @@ namespace Antmicro.Renode.Peripherals.SD
                         ), name: "card command classes")
                     .DefineFragment(96, 3, (uint)TransferRate.Transfer10Mbit, name: "transfer rate unit")
                     .DefineFragment(99, 4, (uint)TransferMultiplier.Multiplier2_5, name: "transfer multiplier")
-                    .DefineFragment(126, 2, (uint)CSD.Version1, name: "CSD structure")
+                    .DefineFragment(126, 2, (uint)(emmc ? CSD.EmmcVersion1_2 : CSD.Version1), name: "CSD structure")
                 ;
             }
             else
@@ -311,10 +389,31 @@ namespace Antmicro.Renode.Peripherals.SD
                         ), name: "card command classes")
                     .DefineFragment(96, 3, (uint)TransferRate.Transfer10Mbit, name: "transfer rate unit")
                     .DefineFragment(99, 5, (uint)TransferMultiplier.Multiplier2_5, name: "transfer multiplier")
-                    .DefineFragment(126, 2, (uint)CSD.Version2, name: "CSD structure")
+                    .DefineFragment(126, 2, (uint)(emmc ? CSD.EmmcVersion1_2 : CSD.Version2), name: "CSD structure")
                 ;
             }
 
+            if(emmc)
+            {
+                // The host only reads EXT_CSD (and so enumerates the boot/RPMB partitions) when the CSD reports SPEC_VERS >= 4 (JESD84-B51 section 7.3.2, SPEC_VERS [125:122])
+                cardSpecificDataGenerator.DefineFragment(122, 4, 4, name: "SPEC_VERS");
+                // bootImageSize (if set) overrides the default; rounded down to whole 128 KiB BOOT_SIZE_MULT units (max 32 MiB)
+                var bootSizeMult = bootImageSize > 0 ? (byte)(bootImageSize / EmmcSizeMultUnit) : EmmcBootSizeMult;
+                emmcExtendedCsd = BuildExtendedCsd(capacity, bootSizeMult);
+
+                // Each eMMC hardware partition is its own storage, selected at runtime by PARTITION_ACCESS (CMD6 -> EXT_CSD[179], JESD84-B51 7.4.69)
+                var bootSize = bootSizeMult * EmmcSizeMultUnit;
+                bootPartitions = new[]
+                {
+                    CreatePartitionStorage(bootPartition0Image, bootSize, persistent),
+                    CreatePartitionStorage(bootPartition1Image, bootSize, persistent),
+                };
+                rpmbPartition = DataStorage.CreateInMemory(EmmcRpmbSizeMult * EmmcSizeMultUnit);
+            }
+
+            // XXX:
+            // Legacy SD EXT_CSD accessor, used only by `MPFS_SDController` (hacky non-eMMC path)
+            // eMMC hosts read EXT_CSD via CMD8 -> `emmcExtendedCsd` instead
             extendedCardSpecificDataGenerator = new VariableLengthValue(4096)
                 .DefineFragment(120, 8, 1, name: "command queue enabled")
                 .DefineFragment(200, 1, 1, name: "HS400 support")
@@ -367,205 +466,45 @@ namespace Antmicro.Renode.Peripherals.SD
             spiContext.DataBuffer = new byte[bufferSize + 4];
         }
 
-        private void WriteData(byte[] data, int length)
+        private bool TryHandleApplicationSpecificCommand(SdCardApplicationSpecificCommand command, uint arg, out BitStream result)
         {
-            WriteDataToUnderlyingFile(writeContext.Offset, length, data);
-            writeContext.Move((uint)length);
-            state = SDCardState.Transfer;
-        }
-
-        private void WriteDataToUnderlyingFile(long offset, int size, byte[] data)
-        {
-            dataBackend.Position = offset;
-            var actualSize = checked((int)Math.Min(size, dataBackend.Length - dataBackend.Position));
-            if(actualSize < size)
+            this.Log(LogLevel.Noisy, "Handling as an application specific command: {0}", command);
+            switch(command)
             {
-                this.Log(LogLevel.Warning, "Tried to write {0} bytes of data to offset {1}, but space for only {2} is available.", size, offset, actualSize);
-            }
-            dataBackend.Write(data, 0, actualSize);
-        }
+            case SdCardApplicationSpecificCommand.SendSDCardStatus_ACMD13:
+                readContext.Data = SDStatus;
+                result = spiMode
+                    ? GenerateR2Response()
+                    : CardStatus;
+                return true;
 
-        private byte[] ReadDataFromUnderlyingFile(long offset, int size)
-        {
-            dataBackend.Position = offset;
-            var actualSize = checked((int)Math.Min(size, dataBackend.Length - dataBackend.Position));
-            if(actualSize < size)
-            {
-                this.Log(LogLevel.Warning, "Tried to read {0} bytes of data from offset {1}, but only {2} is available.", size, offset, actualSize);
-            }
-
-            /* During multi-block read, when reading till the end of disk, the SD card could reach end of disk before receiving
-             * stop transmission command. SD card specification doesn't specify what should be done in such situation.
-             * Return 0s as missing bytes.
-             */
-            var result = new byte[size];
-            var readSoFar = 0;
-            while(readSoFar < actualSize)
-            {
-                var readThisTime = dataBackend.Read(result, readSoFar, actualSize - readSoFar);
-                if(readThisTime == 0)
+            case SdCardApplicationSpecificCommand.SendOperatingConditionRegister_ACMD41:
+                // If HCS is set to 0, High Capacity SD Memory Card never returns ready state
+                var hcs = BitHelper.IsBitSet(arg, 30);
+                if(!highCapacityMode || hcs)
                 {
-                    // this should not happen as we calculated the available data size
-                    throw new ArgumentException("Unexpected end of data in file stream");
+                    // activate the card
+                    state = SDCardState.Ready;
                 }
-                readSoFar += readThisTime;
+
+                result = spiMode
+                    ? GenerateR1Response()
+                    : OperatingConditions;
+                return true;
+
+            case SdCardApplicationSpecificCommand.SendSDConfigurationRegister_ACMD51:
+                readContext.Data = SDConfiguration;
+                state = SDCardState.SendingData;
+                result = spiMode
+                    ? GenerateRegisterResponse(SDConfiguration)
+                    : CardStatus;
+                return true;
+
+            default:
+                this.Log(LogLevel.Noisy, "Command #{0} seems not to be any application specific command", command);
+                result = null;
+                return false;
             }
-
-            return result;
-        }
-
-        private void GoToIdle()
-        {
-            readContext.Reset();
-            writeContext.Reset();
-            treatNextCommandAsAppCommand = false;
-
-            state = SDCardState.Idle;
-
-            spiContext.Reset();
-        }
-
-        /* Data packet has the following format:
-         * bytes:
-         * [ 0                          ] data token
-         * [ 1            : blockSize   ] actual data
-         * [ blocksSize+1 : blockSize+2 ] CRC
-         *
-         * After sending CRC, we have to send single DummyByte before sending next
-         * data packet.
-         */
-        private byte HandleRead()
-        {
-            var blockSize = highCapacityMode ? HighCapacityBlockLength : blockLengthInBytes;
-            ushort crc = 0;
-
-            if(spiContext.BytesSent == 0)
-            {
-                var readData = ReadData(blockSize);
-                crc = (ushort)crcEngine.Calculate(readData);
-
-                spiContext.DataBuffer[0] = BlockBeginIndicator;
-                System.Array.Copy(readData, 0, spiContext.DataBuffer, 1, blockSize);
-                spiContext.DataBuffer[blockSize + 1] = crc.HiByte();
-                spiContext.DataBuffer[blockSize + 2] = crc.LoByte();
-                // before sending new packet, at least one DummyByte should be sent
-                spiContext.DataBuffer[blockSize + 3] = DummyByte;
-            }
-
-            var res = spiContext.DataBuffer[spiContext.BytesSent];
-
-            spiContext.BytesSent++;
-            // We sent whole required data and can proceed to the next data packet,
-            // or finish the data read.
-            if(spiContext.BytesSent == blockSize + 4)
-            {
-                if(spiContext.IoState == IoState.SingleBlockRead)
-                {
-                    spiContext.IoState = IoState.Idle;
-                }
-                spiContext.BytesSent = 0;
-            }
-            return res;
-        }
-
-        /* Data packet has the following format:
-         * bytes:
-         * [ 0                          ] data token
-         * [ 1            : blockSize   ] actual data
-         * [ blocksSize+1 : blockSize+2 ] CRC
-         *
-         * After sending CRC, we have to send data response.
-         */
-        private byte HandleWrite(byte data)
-        {
-            var blockSize = highCapacityMode ? HighCapacityBlockLength : blockLengthInBytes;
-
-            switch(spiContext.ReceptionState)
-            {
-            case ReceptionState.WaitingForDataToken:
-                switch((DataToken)data)
-                {
-                case DataToken.StopTran:
-                    spiContext.IoState = IoState.Idle;
-                    state = SDCardState.Programming;
-                    break;
-                case DataToken.SingleWriteStartBlock:
-                case DataToken.MultiWriteStartBlock:
-                    spiContext.DataBytesReceived = 0;
-                    spiContext.ReceptionState = ReceptionState.ReceivingData;
-                    break;
-                }
-                return DummyByte;
-            case ReceptionState.ReceivingData:
-                spiContext.DataBuffer[spiContext.DataBytesReceived] = data;
-                spiContext.DataBytesReceived++;
-                if(spiContext.DataBytesReceived == blockSize)
-                {
-                    spiContext.ReceptionState = ReceptionState.ReceivingCRC;
-                    spiContext.CRCBytesReceived = 0;
-                }
-                return DummyByte;
-            case ReceptionState.ReceivingCRC:
-                spiContext.CRCBytesReceived++;
-                if(spiContext.CRCBytesReceived == 2)
-                {
-                    spiContext.ReceptionState = ReceptionState.SendingResponse;
-                }
-                return DummyByte;
-            case ReceptionState.SendingResponse:
-                WriteData(spiContext.DataBuffer, (int)blockSize);
-                spiContext.ReceptionState = ReceptionState.WaitingForDataToken;
-                if(spiContext.IoState == IoState.SingleBlockWrite)
-                {
-                    spiContext.IoState = IoState.Idle;
-                    state = SDCardState.Programming;
-                }
-                return DataAcceptedResponse;
-            }
-            return DummyByte;
-        }
-
-        private BitStream GenerateR1Response(bool illegalCommand = false)
-        {
-            return new BitStream()
-                .AppendBit(state == SDCardState.Idle)
-                .AppendBit(false) // Erase Reset
-                .AppendBit(illegalCommand)
-                .AppendBit(false) // Com CRC Error
-                .AppendBit(false) // Erase Seq Error
-                .AppendBit(false) // Address Error
-                .AppendBit(false) // Parameter Error
-                .AppendBit(false); // always 0
-        }
-
-        private BitStream GenerateR2Response()
-        {
-            return GenerateR1Response()
-                .Append((byte)0); // TODO: fill with the actual data
-        }
-
-        private BitStream GenerateR3Response()
-        {
-            return GenerateR1Response()
-                .Append(OperatingConditions.AsByteArray());
-        }
-
-        private BitStream GenerateR7Response(byte checkPattern)
-        {
-            return GenerateR1Response()
-                .Append(OperatingVoltage.AsByteArray().Reverse().ToArray())
-                .Append(checkPattern);
-        }
-
-        private BitStream GenerateRegisterResponse(BitStream register)
-        {
-            var reg = register.AsByteArray().Reverse().ToArray();
-            ushort crc = (ushort)crcEngine.Calculate(reg);
-            return GenerateR1Response()
-                .Append(BlockBeginIndicator)
-                .Append(reg)
-                .Append(crc.HiByte())
-                .Append(crc.LoByte());
         }
 
         private BitStream HandleStandardCommand(SdCardCommand command, uint arg)
@@ -607,6 +546,16 @@ namespace Antmicro.Renode.Peripherals.SD
 
                 state = SDCardState.Standby;
 
+                if(emmc)
+                {
+                    // eMMC CMD3 is SET_RELATIVE_ADDR (JESD84-B51 Table 49: "[31:16] RCA, Assigns relative address to the Device"): the host assigns the RCA, unlike SD where the card generates it
+                    CardAddress = (ushort)(arg >> 16);
+                    return CardStatus;
+                }
+
+                // CMD7 requires us to come up with a new address each invocation
+                CardAddress += 1;
+
                 var status = CardStatus.AsUInt32();
                 return BitHelper.BitConcatenator.New()
                     .StackAbove(status, 13, 0)
@@ -617,6 +566,55 @@ namespace Antmicro.Renode.Peripherals.SD
             }
 
             case SdCardCommand.CheckSwitchableFunction_CMD6:
+                if(emmc)
+                {
+                    // eMMC CMD6 is SWITCH (JESD84-B51 Table 49, R1b): it modifies one EXT_CSD byte, arg = [Access:2][Index:8][Value:8][..]
+                    // CMD6 is generic, but the only EXT_CSD field we model is PARTITION_CONFIG [179] (7.4.69)
+                    switchError = false;
+                    var access = (arg >> 24) & 0x3;
+                    var index = (int)((arg >> 16) & 0xFF);
+                    var value = (byte)(arg >> 8);
+                    if(index != PartitionConfigExtCsdIndex)
+                    {
+                        this.Log(LogLevel.Warning, "eMMC SWITCH (CMD6): EXT_CSD byte [{0}] is not modeled (access {1}, value 0x{2:X}); ignoring the write.", index, access, value);
+                    }
+                    else
+                    {
+                        var partitionConfig = emmcExtendedCsd[index];
+                        switch(access)
+                        {
+                        case 0: // Command Set
+                            this.Log(LogLevel.Warning, "eMMC SWITCH (CMD6): Command Set switching is not implemented; ignoring it.");
+                            break;
+                        case 1: // set bits
+                            partitionConfig |= value;
+                            break;
+                        case 2: // clear bits
+                            partitionConfig &= (byte)~value;
+                            break;
+                        case 3: // write byte
+                            partitionConfig = value;
+                            break;
+                        }
+
+                        var requestedPartition = partitionConfig & PartitionAccessMask;
+                        if(requestedPartition > RpmbPartitionAccess)
+                        {
+                            switchError = true;
+                            this.Log(LogLevel.Warning, "Tried to select unavailable eMMC general-purpose partition {0}.", requestedPartition - RpmbPartitionAccess);
+                        }
+                        else
+                        {
+                            emmcExtendedCsd[index] = partitionConfig;
+                            activePartition = (EmmcPartition)requestedPartition;
+                            this.Log(LogLevel.Noisy, "Switched to eMMC partition {0} (PARTITION_ACCESS {1})", activePartition, requestedPartition);
+                        }
+                    }
+                }
+                // eMMC SWITCH (CMD6) is R1b (JESD84-B51 6.6.1): its result is reported via the SWITCH_ERROR bit
+                // (Table 68, bit 7) of the Device Status, read back by the host with SEND_STATUS (CMD13). eMMC is
+                // never in SPI mode (rejected in the constructor), so it always returns CardStatus - which carries
+                // SWITCH_ERROR; the GenerateR1Response()/SPI branch applies only to SD cards.
                 return spiMode
                     ? GenerateR1Response()
                     : CardStatus;
@@ -628,26 +626,49 @@ namespace Antmicro.Renode.Peripherals.SD
                     // this command is not supported in the SPI mode
                     break;
                 }
-
-                // this is a toggle command:
-                // Select is used to start a transfer;
-                // Deselct is used to abort the active transfer
-                switch(state)
+                ushort rca = (ushort)(arg >> 16);
+                // If the argument RCA matches our RCA, go to transfer or programming mode, otherwise go to standby or disconnected mode (RCA 0 always does the latter)
+                if(rca == CardAddress && rca != 0)
                 {
-                case SDCardState.Standby:
-                    state = SDCardState.Transfer;
-                    break;
-
-                case SDCardState.Transfer:
-                case SDCardState.Programming:
-                    state = SDCardState.Standby;
-                    break;
+                    if(state == SDCardState.Standby)
+                    {
+                        state = SDCardState.Transfer;
+                    }
+                    else if(state == SDCardState.Disconnect)
+                    {
+                        state = SDCardState.Programming;
+                    }
+                }
+                else
+                {
+                    if(state == SDCardState.Transfer)
+                    {
+                        state = SDCardState.Standby;
+                    }
+                    else if(state == SDCardState.Programming)
+                    {
+                        state = SDCardState.Disconnect;
+                    }
                 }
 
                 return CardStatus;
             }
 
             case SdCardCommand.SendInterfaceConditionCommand_CMD8:
+                if(emmc)
+                {
+                    // CMD8 is overloaded: SD SEND_IF_COND vs eMMC SEND_EXT_CSD (JESD84-B51 Table 49),
+                    // which is valid only once selected (Transfer state). Before then it can only be
+                    // the SD probe - return empty so the host does not identify us as an SD card.
+                    if(state != SDCardState.Transfer)
+                    {
+                        return BitStream.Empty;
+                    }
+                    emmcExtendedCsdOffset = 0;
+                    sendingExtendedCsd = true;
+                    state = SDCardState.SendingData;
+                    return CardStatus;
+                }
                 return spiMode
                     ? GenerateR7Response((byte)arg)
                     : CardStatus;
@@ -748,7 +769,14 @@ namespace Antmicro.Renode.Peripherals.SD
                     : CardStatus;
 
             case SdCardCommand.AppCommand_CMD55:
-                treatNextCommandAsAppCommand = true;
+                if(emmc)
+                {
+                    // eMMC identifies via CMD1/SEND_OP_COND (JESD84-B51 Table 49, section 6.4.4), not
+                    // the SD CMD55/ACMD41 op-cond. Not answering the APP_CMD probe makes it time out so
+                    // mmc_get_op_cond() falls through to CMD1 and identifies the device as eMMC.
+                    return BitStream.Empty;
+                }
+                TreatNextCommandAsAppCommand = true;
                 return spiMode
                     ? GenerateR1Response()
                     : CardStatus;
@@ -771,50 +799,252 @@ namespace Antmicro.Renode.Peripherals.SD
                 : BitStream.Empty;
         }
 
-        private bool TryHandleApplicationSpecificCommand(SdCardApplicationSpecificCommand command, uint arg, out BitStream result)
+        private BitStream GenerateRegisterResponse(BitStream register)
         {
-            this.Log(LogLevel.Noisy, "Handling as an application specific command: {0}", command);
-            switch(command)
+            var reg = register.AsByteArray().Reverse().ToArray();
+            ushort crc = (ushort)crcEngine.Calculate(reg);
+            return GenerateR1Response()
+                .Append(BlockBeginIndicator)
+                .Append(reg)
+                .Append(crc.HiByte())
+                .Append(crc.LoByte());
+        }
+
+        private BitStream GenerateR7Response(byte checkPattern)
+        {
+            return GenerateR1Response()
+                .Append(OperatingVoltage.AsByteArray().Reverse().ToArray())
+                .Append(checkPattern);
+        }
+
+        private BitStream GenerateR3Response()
+        {
+            return GenerateR1Response()
+                .Append(OperatingConditions.AsByteArray());
+        }
+
+        private BitStream GenerateR1Response(bool illegalCommand = false)
+        {
+            return new BitStream()
+                .AppendBit(state == SDCardState.Idle)
+                .AppendBit(false) // Erase Reset
+                .AppendBit(illegalCommand)
+                .AppendBit(false) // Com CRC Error
+                .AppendBit(false) // Erase Seq Error
+                .AppendBit(false) // Address Error
+                .AppendBit(false) // Parameter Error
+                .AppendBit(false); // always 0
+        }
+
+        private BitStream GenerateR2Response()
+        {
+            return GenerateR1Response()
+                .Append((byte)0); // TODO: fill with the actual data
+        }
+
+        /* Data packet has the following format:
+         * bytes:
+         * [ 0                          ] data token
+         * [ 1            : blockSize   ] actual data
+         * [ blocksSize+1 : blockSize+2 ] CRC
+         *
+         * After sending CRC, we have to send single DummyByte before sending next
+         * data packet.
+         */
+        private byte HandleRead()
+        {
+            var blockSize = highCapacityMode ? HighCapacityBlockLength : blockLengthInBytes;
+            ushort crc = 0;
+
+            if(spiContext.BytesSent == 0)
             {
-            case SdCardApplicationSpecificCommand.SendSDCardStatus_ACMD13:
-                readContext.Data = SDStatus;
-                result = spiMode
-                    ? GenerateR2Response()
-                    : CardStatus;
-                return true;
+                var readData = ReadData(blockSize);
+                crc = (ushort)crcEngine.Calculate(readData);
 
-            case SdCardApplicationSpecificCommand.SendOperatingConditionRegister_ACMD41:
-                // If HCS is set to 0, High Capacity SD Memory Card never returns ready state
-                var hcs = BitHelper.IsBitSet(arg, 30);
-                if(!highCapacityMode || hcs)
+                spiContext.DataBuffer[0] = BlockBeginIndicator;
+                System.Array.Copy(readData, 0, spiContext.DataBuffer, 1, blockSize);
+                spiContext.DataBuffer[blockSize + 1] = crc.HiByte();
+                spiContext.DataBuffer[blockSize + 2] = crc.LoByte();
+                // before sending new packet, at least one DummyByte should be sent
+                spiContext.DataBuffer[blockSize + 3] = DummyByte;
+            }
+
+            var res = spiContext.DataBuffer[spiContext.BytesSent];
+
+            spiContext.BytesSent++;
+            // We sent whole required data and can proceed to the next data packet,
+            // or finish the data read.
+            if(spiContext.BytesSent == blockSize + 4)
+            {
+                if(spiContext.IoState == IoState.SingleBlockRead)
                 {
-                    // activate the card
-                    state = SDCardState.Ready;
+                    spiContext.IoState = IoState.Idle;
                 }
+                spiContext.BytesSent = 0;
+            }
+            return res;
+        }
 
-                result = spiMode
-                    ? GenerateR1Response()
-                    : OperatingConditions;
-                return true;
+        private void GoToIdle()
+        {
+            readContext.Reset();
+            writeContext.Reset();
+            TreatNextCommandAsAppCommand = false;
 
-            case SdCardApplicationSpecificCommand.SendSDConfigurationRegister_ACMD51:
-                readContext.Data = SDConfiguration;
-                state = SDCardState.SendingData;
-                result = spiMode
-                    ? GenerateRegisterResponse(SDConfiguration)
-                    : CardStatus;
-                return true;
+            if(emmc)
+            {
+                // CMD0 resets PARTITION_ACCESS to the user area: it is R/W/E_P in PARTITION_CONFIG [179] (JESD84-B51 7.4.69, Table 147), and R/W/E_P is "reset ... [on] any CMD0".
+                sendingExtendedCsd = false;
+                emmcExtendedCsdOffset = 0;
+                emmcExtendedCsd[PartitionConfigExtCsdIndex] = 0;
+                activePartition = EmmcPartition.UserDataArea;
+                switchError = false;
+            }
 
-            default:
-                this.Log(LogLevel.Noisy, "Command #{0} seems not to be any application specific command", command);
-                result = null;
-                return false;
+            state = SDCardState.Idle;
+
+            spiContext.Reset();
+        }
+
+        private byte[] ReadDataFromUnderlyingFile(long offset, int size)
+        {
+            var backend = ActiveBackend;
+            backend.Position = offset;
+            var actualSize = checked((int)Math.Min(size, backend.Length - backend.Position));
+            if(actualSize < size)
+            {
+                this.Log(LogLevel.Warning, "Tried to read {0} bytes of data from offset {1}, but only {2} is available.", size, offset, actualSize);
+            }
+
+            /* During multi-block read, when reading till the end of disk, the SD card could reach end of disk before receiving
+             * stop transmission command. SD card specification doesn't specify what should be done in such situation.
+             * Return 0s as missing bytes.
+             */
+            var result = new byte[size];
+            var readSoFar = 0;
+            while(readSoFar < actualSize)
+            {
+                var readThisTime = backend.Read(result, readSoFar, actualSize - readSoFar);
+                if(readThisTime == 0)
+                {
+                    // this should not happen as we calculated the available data size
+                    throw new ArgumentException("Unexpected end of data in file stream");
+                }
+                readSoFar += readThisTime;
+            }
+
+            return result;
+        }
+
+        private void WriteDataToUnderlyingFile(long offset, int size, byte[] data)
+        {
+            var backend = ActiveBackend;
+            if(emmc)
+            {
+                this.Log(LogLevel.Noisy, "Writing {0} bytes to eMMC partition {1} at offset 0x{2:X}", size, activePartition, offset);
+            }
+            backend.Position = offset;
+            var actualSize = checked((int)Math.Min(size, backend.Length - backend.Position));
+            if(actualSize < size)
+            {
+                this.Log(LogLevel.Warning, "Tried to write {0} bytes of data to offset {1}, but space for only {2} is available.", size, offset, actualSize);
+            }
+            backend.Write(data, 0, actualSize);
+        }
+
+        private void WriteData(byte[] data, int length)
+        {
+            WriteDataToUnderlyingFile(writeContext.Offset, length, data);
+            writeContext.Move((uint)length);
+            state = SDCardState.Transfer;
+        }
+
+        /* Data packet has the following format:
+         * bytes:
+         * [ 0                          ] data token
+         * [ 1            : blockSize   ] actual data
+         * [ blocksSize+1 : blockSize+2 ] CRC
+         *
+         * After sending CRC, we have to send data response.
+         */
+        private byte HandleWrite(byte data)
+        {
+            var blockSize = highCapacityMode ? HighCapacityBlockLength : blockLengthInBytes;
+
+            switch(spiContext.ReceptionState)
+            {
+            case ReceptionState.WaitingForDataToken:
+                switch((DataToken)data)
+                {
+                case DataToken.StopTran:
+                    spiContext.IoState = IoState.Idle;
+                    state = SDCardState.Programming;
+                    break;
+                case DataToken.SingleWriteStartBlock:
+                case DataToken.MultiWriteStartBlock:
+                    spiContext.DataBytesReceived = 0;
+                    spiContext.ReceptionState = ReceptionState.ReceivingData;
+                    break;
+                }
+                return DummyByte;
+            case ReceptionState.ReceivingData:
+                spiContext.DataBuffer[spiContext.DataBytesReceived] = data;
+                spiContext.DataBytesReceived++;
+                if(spiContext.DataBytesReceived == blockSize)
+                {
+                    spiContext.ReceptionState = ReceptionState.ReceivingCRC;
+                    spiContext.CRCBytesReceived = 0;
+                }
+                return DummyByte;
+            case ReceptionState.ReceivingCRC:
+                spiContext.CRCBytesReceived++;
+                if(spiContext.CRCBytesReceived == 2)
+                {
+                    spiContext.ReceptionState = ReceptionState.SendingResponse;
+                }
+                return DummyByte;
+            case ReceptionState.SendingResponse:
+                WriteData(spiContext.DataBuffer, (int)blockSize);
+                spiContext.ReceptionState = ReceptionState.WaitingForDataToken;
+                if(spiContext.IoState == IoState.SingleBlockWrite)
+                {
+                    spiContext.IoState = IoState.Idle;
+                    state = SDCardState.Programming;
+                }
+                return DataAcceptedResponse;
+            }
+            return DummyByte;
+        }
+
+        private Stream ActiveBackend
+        {
+            get
+            {
+                switch(activePartition)
+                {
+                case EmmcPartition.UserDataArea:
+                    return dataBackend;
+                case EmmcPartition.Boot0:
+                    return bootPartitions[0];
+                case EmmcPartition.Boot1:
+                    return bootPartitions[1];
+                case EmmcPartition.Rpmb:
+                    return rpmbPartition;
+                default:
+                    this.Log(LogLevel.Error, $"Selected unsupported eMMC hardware partition: {activePartition}, fallbacking to User Data Partition");
+                    return dataBackend;
+                }
             }
         }
 
+        private int emmcExtendedCsdOffset;
+
+        private bool sendingExtendedCsd;
+        private bool switchError;
+        private EmmcPartition activePartition;
+
         private SDCardState state;
 
-        private bool treatNextCommandAsAppCommand;
         private uint blockLengthInBytes;
         private IoContext writeContext;
         private IoContext readContext;
@@ -827,10 +1057,14 @@ namespace Antmicro.Renode.Peripherals.SD
         private readonly VariableLengthValue cardIdentificationGenerator;
         private readonly VariableLengthValue switchFunctionStatusGenerator;
         private readonly VariableLengthValue operatingVoltageGenerator;
+        private readonly byte[] emmcExtendedCsd;
+        private readonly Stream[] bootPartitions;
+        private readonly Stream rpmbPartition;
 
         private readonly long capacity;
         private readonly BlockLength blockSize;
         private readonly bool spiMode;
+        private readonly bool emmc;
         private readonly bool highCapacityMode;
         private readonly SpiContext spiContext;
         private readonly CRCEngine crcEngine;
@@ -838,6 +1072,48 @@ namespace Antmicro.Renode.Peripherals.SD
         private const byte BlockBeginIndicator = 0xFE;
         private const int HighCapacityBlockLength = 512;
         private const byte DataAcceptedResponse = 0x05;
+        private const int EmmcExtendedCsdLength = 512;
+        private const int EmmcSizeMultUnit = 128 * 1024; // BOOT_SIZE_MULT / RPMB_SIZE_MULT unit
+        private const int PartitionConfigExtCsdIndex = 179; // EXT_CSD PARTITION_CONFIG
+        private const int PartitionAccessMask = 0b111;
+        private const int RpmbPartitionAccess = 3;
+        private const byte EmmcBootSizeMult = 64; // 128 KiB * 64 == 8 MiB (override via the bootImageSize ctor parameter)
+        private const byte EmmcRpmbSizeMult = 1;
+        // Advertise HS 52 MHz only so hosts skip HS200/HS400 tuning we do not model
+        private const DeviceType EmmcDeviceType = DeviceType.SDR50Mhz;
+
+        public enum SdCardCommand
+        {
+            GoIdleState_CMD0 = 0,
+            SendSupportInformation_CMD1 = 1,
+            SendCardIdentification_CMD2 = 2,
+            SendRelativeAddress_CMD3 = 3,
+            CheckSwitchableFunction_CMD6 = 6, // v1.1+
+            SelectDeselectCard_CMD7 = 7,
+            SendInterfaceConditionCommand_CMD8 = 8, // v2+
+            SendCardSpecificData_CMD9 = 9,
+            SendCardIdentification_CMD10 = 10,
+            StopTransmission_CMD12 = 12,
+            SendStatus_CMD13 = 13,
+            SetBlockLength_CMD16 = 16,
+            ReadSingleBlock_CMD17 = 17,
+            ReadMultipleBlocks_CMD18 = 18,
+            SendTuneBlock_CMD21 = 21,
+            SetBlockCount_CMD23 = 23,
+            WriteSingleBlock_CMD24 = 24,
+            WriteMultipleBlocks_CMD25 = 25,
+            IOReadWriteDirect_CM52 = 52,
+            AppCommand_CMD55 = 55,
+            ReadOperationConditionRegister_CMD58 = 58,
+            EnableCRCChecking_CMD59 = 59
+        }
+
+        public enum SdCardApplicationSpecificCommand
+        {
+            SendSDCardStatus_ACMD13 = 13,
+            SendOperatingConditionRegister_ACMD41 = 41,
+            SendSDConfigurationRegister_ACMD51 = 51
+        }
 
         private class SpiContext
         {
@@ -908,40 +1184,6 @@ namespace Antmicro.Renode.Peripherals.SD
             private uint bytesLeft;
             private uint offset;
             private BitStream data;
-        }
-
-        private enum SdCardCommand
-        {
-            GoIdleState_CMD0 = 0,
-            SendSupportInformation_CMD1 = 1,
-            SendCardIdentification_CMD2 = 2,
-            SendRelativeAddress_CMD3 = 3,
-            CheckSwitchableFunction_CMD6 = 6,
-            SelectDeselectCard_CMD7 = 7,
-            // this command has been added in spec version 2.0 - we don't have to answer to it
-            SendInterfaceConditionCommand_CMD8 = 8,
-            SendCardSpecificData_CMD9 = 9,
-            SendCardIdentification_CMD10 = 10,
-            StopTransmission_CMD12 = 12,
-            SendStatus_CMD13 = 13,
-            SetBlockLength_CMD16 = 16,
-            ReadSingleBlock_CMD17 = 17,
-            ReadMultipleBlocks_CMD18 = 18,
-            SendTuneBlock_CMD21 = 21,
-            SetBlockCount_CMD23 = 23,
-            WriteSingleBlock_CMD24 = 24,
-            WriteMultipleBlocks_CMD25 = 25,
-            IOReadWriteDirect_CM52 = 52,
-            AppCommand_CMD55 = 55,
-            ReadOperationConditionRegister_CMD58 = 58,
-            EnableCRCChecking_CMD59 = 59
-        }
-
-        private enum SdCardApplicationSpecificCommand
-        {
-            SendSDCardStatus_ACMD13 = 13,
-            SendOperatingConditionRegister_ACMD41 = 41,
-            SendSDConfigurationRegister_ACMD51 = 51
         }
 
         [Flags]
@@ -1032,6 +1274,15 @@ namespace Antmicro.Renode.Peripherals.SD
             SendingResponse
         }
 
+        // JESD84-B51 7.4.69
+        private enum EmmcPartition
+        {
+            UserDataArea = 0,
+            Boot0 = 1,
+            Boot1 = 2,
+            Rpmb = 3
+        }
+
         private enum SDCardState
         {
             Idle = 0,
@@ -1049,7 +1300,8 @@ namespace Antmicro.Renode.Peripherals.SD
         private enum CSD
         {
             Version1 = 0,
-            Version2 = 1
+            Version2 = 1,
+            EmmcVersion1_2 = 2,
         }
     }
 }

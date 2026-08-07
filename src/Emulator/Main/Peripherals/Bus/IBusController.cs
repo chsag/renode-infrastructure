@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2010-2025 Antmicro
+// Copyright (c) 2010-2026 Antmicro
 //
 // This file is licensed under the MIT License.
 // Full license text is available in 'licenses/MIT.txt'.
@@ -22,9 +22,9 @@ using Range = Antmicro.Renode.Core.Range;
 
 namespace Antmicro.Renode.Peripherals.Bus
 {
-    public interface IBusController : IPeripheralContainer<IBusPeripheral, BusRangeRegistration>, IPeripheralRegister<IKnownSize, BusPointRegistration>,
-        IPeripheralRegister<ICPU, CPURegistrationPoint>, IPeripheralRegister<IBusPeripheral, BusMultiRegistration>, IPeripheralRegister<IPeripheral, NullRegistrationPoint>,
-        IPeripheralRegister<IBusPeripheral, BusParametrizedRegistration>, ICanLoadFiles, IPeripheral, IMultibyteWritePeripheral, IHasDelayedInvalidationContext
+    public interface IBusController : IPeripheralContainer<IBusPeripheral, BusRangeRegistration>, IRegisterablePeripheral<IKnownSize, BusPointRegistration>,
+        IRegisterablePeripheral<ICPU, CPURegistrationPoint>, IRegisterablePeripheral<IBusPeripheral, BusMultiRegistration>, IRegisterablePeripheral<IPeripheral, NullRegistrationPoint>,
+        IRegisterablePeripheral<IBusPeripheral, BusParametrizedRegistration>, ICanLoadFiles, IPeripheral, IMultibyteWritePeripheral, IHasDelayedInvalidationContext
     {
         byte ReadByte(ulong address, IPeripheral context = null, ulong? cpuState = null);
 
@@ -62,6 +62,10 @@ namespace Antmicro.Renode.Peripherals.Bus
 
         byte[] ReadBytes(ulong address, int count, bool onlyMemory = false, IPeripheral context = null);
 
+        ulong[] FindBytes(byte[] pattern, ulong startAddress = 0, ulong? endAddress = null, IPeripheral context = null);
+
+        ulong[] FindBytes(string hexString, ulong startAddress = 0, ulong? endAddress = null, IPeripheral context = null);
+
         void WriteBytes(byte[] bytes, ulong address, bool onlyMemory = false, IPeripheral context = null);
 
         void WriteBytes(byte[] bytes, ulong address, int startingIndex, long count, bool onlyMemory = false, IPeripheral context = null);
@@ -74,7 +78,7 @@ namespace Antmicro.Renode.Peripherals.Bus
 
         IBusRegistered<IBusPeripheral> WhatIsAt(ulong address, IPeripheral context = null);
 
-        IPeripheral WhatPeripheralIsAt(ulong address, IPeripheral context = null);
+        IPeripheral WhatPeripheralIsAt(ulong address, IPeripheral context = null, ulong? initiatorState = null);
 
         bool IsAddressRangeLocked(Range range, IPeripheral context = null);
 
@@ -132,6 +136,8 @@ namespace Antmicro.Renode.Peripherals.Bus
 
         void MapMemory(IMappedSegment segment, IBusPeripheral owner, bool relative = true, ICPUWithMappedMemory context = null);
 
+        void UnmapMemory(Range range, ICPU context = null);
+
         IBusRegistered<MappedMemory> FindMemory(ulong address, ICPU context = null);
 
         bool IsMemory(ulong address, ICPU context = null, ulong? initiatorState = null);
@@ -159,6 +165,8 @@ namespace Antmicro.Renode.Peripherals.Bus
         bool IsMultiCore { get; }
 
         Endianess Endianess { get; }
+
+        UnhandledAccessBehaviour UnhandledAccessBehaviour { get; set; }
 
         event Action<IMachine> OnSymbolsChanged;
 

@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2010-2024 Antmicro
+// Copyright (c) 2010-2026 Antmicro
 //
 // This file is licensed under the MIT License.
 // Full license text is available in 'licenses/MIT.txt'.
@@ -7,6 +7,7 @@
 
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Linq;
 
 namespace Antmicro.Renode.Utilities
@@ -142,7 +143,7 @@ namespace Antmicro.Renode.Utilities
                 return;
 
             default:
-                throw new Exception("unreachable");
+                throw new UnreachableException();
             }
 
             if(CurrentState == State.Writing)

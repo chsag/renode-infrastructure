@@ -21,7 +21,7 @@ using Endianess = ELFSharp.ELF.Endianess;
 namespace Antmicro.Renode.Peripherals.CPU
 {
     [GPIO(NumberOfInputs = 4)]
-    public abstract class BaseARMv8 : TranslationCPU, ICPUWithPSCI, IArmWithSystemRegisters
+    public abstract class BaseARMv8 : TranslationCPU, ICPUWithPSCI, IArmWithSystemRegisters, ICPUWithDirtyAdressesSharing
     {
         public BaseARMv8(uint cpuId, string cpuType, IMachine machine, Endianess endianness = Endianess.LittleEndian) : base(cpuId, cpuType, machine, endianness, CpuBitness.Bits64)
         {
@@ -106,6 +106,8 @@ namespace Antmicro.Renode.Peripherals.CPU
                 TlibSetRndrSupported(value ? 1u : 0);
             }
         }
+
+        public override Endianess DisassemblyHexFormatting => Endianess.LittleEndian;
 
         public abstract ExecutionState ExecutionState { get; }
 

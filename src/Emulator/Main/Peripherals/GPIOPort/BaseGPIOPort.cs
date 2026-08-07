@@ -5,6 +5,7 @@
 // This file is licensed under the MIT License.
 // Full license text is available in 'licenses/MIT.txt'.
 //
+using System;
 using System.Collections.Generic;
 using System.Collections.ObjectModel;
 using System.Linq;
@@ -18,9 +19,9 @@ using Antmicro.Renode.Utilities;
 namespace Antmicro.Renode.Peripherals.GPIOPort
 {
     [Icon("gpio")]
-    public abstract class BaseGPIOPort : INumberedGPIOOutput, IPeripheralRegister<IGPIOReceiver, NullRegistrationPoint>,
-        IPeripheralRegister<IGPIOSender, NullRegistrationPoint>, IPeripheralRegister<IGPIOReceiver, NumberRegistrationPoint<int>>,
-        IPeripheral, IGPIOReceiver, IPeripheralRegister<IGPIOSender, NumberRegistrationPoint<int>>
+    public abstract class BaseGPIOPort : INumberedGPIOOutput, IRegisterablePeripheral<IGPIOReceiver, NullRegistrationPoint>,
+        IRegisterablePeripheral<IGPIOSender, NullRegistrationPoint>, IRegisterablePeripheral<IGPIOReceiver, NumberRegistrationPoint<int>>,
+        IPeripheral, IGPIOReceiver, IRegisterablePeripheral<IGPIOSender, NumberRegistrationPoint<int>>
     {
         public virtual void OnGPIO(int number, bool value)
         {
@@ -98,6 +99,23 @@ namespace Antmicro.Renode.Peripherals.GPIOPort
             }
             this.machine = machine;
             Connections = new ReadOnlyDictionary<int, IGPIO>(innerConnections);
+        }
+
+        protected void SetConnectionStateBit(int number, bool value)
+        {
+            if(!CheckPinNumber(number))
+            {
+                throw new IndexOutOfRangeException($"Trying to set unexisting connection number {number}");
+            }
+
+            if(value)
+            {
+                Connections[number].Set();
+            }
+            else
+            {
+                Connections[number].Unset();
+            }
         }
 
         protected void SetConnectionsStateUsingBits(uint bits)

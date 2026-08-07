@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2010-2025 Antmicro
+// Copyright (c) 2010-2026 Antmicro
 // Copyright (c) 2011-2015 Realtime Embedded
 //
 // This file is licensed under the MIT License.
@@ -22,6 +22,12 @@ namespace Antmicro.Renode.Core.Structure.Registers
         T Value { get; set; }
 
         /// <summary>
+        /// Gets or sets the field's shadow value.
+        /// No callbacks are involved upon acccess.
+        /// </summary>
+        T ShadowValue { get; set; }
+
+        /// <summary>
         /// Gets the field's width in bits. It should be used to verify if the value assigned to <cref="Value"> is valid, as exceeding
         /// the field's limits causes an ArgumentException.
         /// </summary>
@@ -33,6 +39,8 @@ namespace Antmicro.Renode.Core.Structure.Registers
 
         Action<T, T> ChangeCallback { get; set; }
 
+        Action<T, T> ShadowReloadCallback { get; set; }
+
         Func<T, T> ValueProviderCallback { get; set; }
     }
 
@@ -41,8 +49,8 @@ namespace Antmicro.Renode.Core.Structure.Registers
         private sealed class ValueRegisterField : RegisterField<ulong>, IValueRegisterField
         {
             public ValueRegisterField(PeripheralRegister parent, int position, int width, FieldMode fieldMode, Action<ulong, ulong> readCallback,
-                Action<ulong, ulong> writeCallback, Action<ulong, ulong> changeCallback, Func<ulong, ulong> valueProviderCallback, string name)
-                : base(parent, position, width, fieldMode, readCallback, writeCallback, changeCallback, valueProviderCallback, name)
+                Action<ulong, ulong> writeCallback, Action<ulong, ulong> changeCallback, Func<ulong, ulong> valueProviderCallback, Action<ulong, ulong> shadowReloadCallback, string name)
+                : base(parent, position, width, fieldMode, readCallback, writeCallback, changeCallback, valueProviderCallback, shadowReloadCallback, name)
             {
             }
 
@@ -60,8 +68,8 @@ namespace Antmicro.Renode.Core.Structure.Registers
         private sealed class EnumRegisterField<TEnum> : RegisterField<TEnum>, IEnumRegisterField<TEnum> where TEnum : struct, IConvertible
         {
             public EnumRegisterField(PeripheralRegister parent, int position, int width, FieldMode fieldMode, Action<TEnum, TEnum> readCallback,
-                Action<TEnum, TEnum> writeCallback, Action<TEnum, TEnum> changeCallback, Func<TEnum, TEnum> valueProviderCallback, string name)
-                : base(parent, position, width, fieldMode, readCallback, writeCallback, changeCallback, valueProviderCallback, name)
+                Action<TEnum, TEnum> writeCallback, Action<TEnum, TEnum> changeCallback, Func<TEnum, TEnum> valueProviderCallback, Action<TEnum, TEnum> shadowReloadCallback, string name)
+                : base(parent, position, width, fieldMode, readCallback, writeCallback, changeCallback, valueProviderCallback, shadowReloadCallback, name)
             {
             }
 
@@ -79,8 +87,8 @@ namespace Antmicro.Renode.Core.Structure.Registers
         private sealed class PacketRegisterField<TPacket> : RegisterField<TPacket>, IPacketRegisterField<TPacket> where TPacket : struct
         {
             public PacketRegisterField(PeripheralRegister parent, int position, int width, FieldMode fieldMode, Action<TPacket, TPacket> readCallback,
-                Action<TPacket, TPacket> writeCallback, Action<TPacket, TPacket> changeCallback, Func<TPacket, TPacket> valueProviderCallback, string name)
-                : base(parent, position, width, fieldMode, readCallback, writeCallback, changeCallback, valueProviderCallback, name)
+                Action<TPacket, TPacket> writeCallback, Action<TPacket, TPacket> changeCallback, Func<TPacket, TPacket> valueProviderCallback, Action<TPacket, TPacket> shadowReloadCallback, string name)
+                : base(parent, position, width, fieldMode, readCallback, writeCallback, changeCallback, valueProviderCallback, shadowReloadCallback, name)
             {
             }
 
@@ -101,8 +109,8 @@ namespace Antmicro.Renode.Core.Structure.Registers
         private sealed class FlagRegisterField : RegisterField<bool>, IFlagRegisterField
         {
             public FlagRegisterField(PeripheralRegister parent, int position, FieldMode fieldMode, Action<bool, bool> readCallback,
-                Action<bool, bool> writeCallback, Action<bool, bool> changeCallback, Func<bool, bool> valueProviderCallback, string name)
-                : base(parent, position, 1, fieldMode, readCallback, writeCallback, changeCallback, valueProviderCallback, name)
+                Action<bool, bool> writeCallback, Action<bool, bool> changeCallback, Func<bool, bool> valueProviderCallback, Action<bool, bool> shadowReloadCallback, string name)
+                : base(parent, position, 1, fieldMode, readCallback, writeCallback, changeCallback, valueProviderCallback, shadowReloadCallback, name)
             {
             }
 
@@ -159,27 +167,48 @@ namespace Antmicro.Renode.Core.Structure.Registers
                 return currentValue;
             }
 
+            public override void CallShadowReloadHandler(ulong oldValue, ulong newValue)
+            {
+                if(ShadowReloadCallback != null)
+                {
+                    var oldValueFiltered = FilterValue(oldValue);
+                    var newValueFiltered = FilterValue(newValue);
+                    ShadowReloadCallback(FromBinary(oldValueFiltered), FromBinary(newValueFiltered));
+                }
+            }
+
             public override string ToString()
             {
                 return $"[RegisterType<{typeof(T).Name}> Value={Value} Width={Width}]";
             }
 
-            public T Value
+            /// <see cref="RegisterField.DumpValue"/>
+            public override Tuple<string, bool> DumpValue(bool allowSideEffects)
             {
-                get
+                var reliable = allowSideEffects || ValueProviderCallback == null;
+
+                if(allowSideEffects && ValueProviderCallback != null)
                 {
-                    return FromBinary(FilterValue(parent.UnderlyingValue));
+                    Value = ValueProviderCallback(Value);
                 }
 
-                set
+                if(typeof(T) == typeof(ulong))
                 {
-                    ulong binary = ToBinary(value);
-                    if((binary >> base.Width) > 0 && base.Width < 64)
-                    {
-                        throw new ConstructionException("Value exceeds the size of the field.");
-                    }
-                    WriteFiltered(binary);
+                    return Tuple.Create($"0x{Value:X}", reliable);
                 }
+                return Tuple.Create($"{Value}", reliable);
+            }
+
+            public T Value
+            {
+                get => GetValueFrom(parent.UnderlyingValue);
+                set => SetValueFrom(ref parent.UnderlyingValue, value);
+            }
+
+            public T ShadowValue
+            {
+                get => GetValueFrom(parent.UnderlyingShadowValue);
+                set => SetValueFrom(ref parent.UnderlyingShadowValue, value);
             }
 
             public new int Width => base.Width;
@@ -192,8 +221,10 @@ namespace Antmicro.Renode.Core.Structure.Registers
 
             public Func<T, T> ValueProviderCallback { get; set; }
 
+            public Action<T, T> ShadowReloadCallback { get; set; }
+
             protected RegisterField(PeripheralRegister parent, int position, int width, FieldMode fieldMode, Action<T, T> readCallback,
-                Action<T, T> writeCallback, Action<T, T> changeCallback, Func<T, T> valueProviderCallback, string name) : base(parent, position, width, fieldMode, name)
+                Action<T, T> writeCallback, Action<T, T> changeCallback, Func<T, T> valueProviderCallback, Action<T, T> shadowReloadCallback, string name) : base(parent, position, width, fieldMode, name)
             {
                 if(!fieldMode.IsReadable() && valueProviderCallback != null)
                 {
@@ -204,11 +235,24 @@ namespace Antmicro.Renode.Core.Structure.Registers
                 WriteCallback = writeCallback;
                 ChangeCallback = changeCallback;
                 ValueProviderCallback = valueProviderCallback;
+                ShadowReloadCallback = shadowReloadCallback;
             }
 
             protected abstract T FromBinary(ulong value);
 
             protected abstract ulong ToBinary(T value);
+
+            private T GetValueFrom(ulong parentValue) => FromBinary(FilterValue(parentValue));
+
+            private void SetValueFrom(ref ulong parentValue, T value)
+            {
+                ulong binary = ToBinary(value);
+                if((binary >> base.Width) > 0 && base.Width < 64)
+                {
+                    throw new ConstructionException("Value exceeds the size of the field.");
+                }
+                parentValue = UnfilterValue(parentValue, binary);
+            }
         }
 
         private abstract class RegisterField
@@ -220,6 +264,20 @@ namespace Antmicro.Renode.Core.Structure.Registers
             public abstract void CallChangeHandler(ulong oldValue, ulong newValue);
 
             public abstract ulong CallValueProviderHandler(ulong currentValue);
+
+            public abstract void CallShadowReloadHandler(ulong oldValue, ulong newValue);
+
+            /// <summary>
+            /// Dump a register field value.
+            /// </summary>
+            /// <param name="allowSideEffects">If true, the call to this method may have a side
+            /// effect by calling <see cref="IRegisterField<T>.ValueProviderCallback"></param>
+            /// <returns>
+            /// A tuple made of the string representation of the value and a boolean indicating if
+            /// the value is reliable or not. A value may not be reliable if the field has a
+            /// ValueProviderCallback that has not been called.
+            /// </returns>
+            public abstract Tuple<string, bool> DumpValue(bool allowSideEffects = false);
 
             public readonly int Position;
             public readonly int Width;
@@ -248,11 +306,6 @@ namespace Antmicro.Renode.Core.Structure.Registers
             {
                 BitHelper.UpdateWithShifted(ref baseValue, fieldValue, Position, Width);
                 return baseValue;
-            }
-
-            protected void WriteFiltered(ulong value)
-            {
-                BitHelper.UpdateWithShifted(ref parent.UnderlyingValue, value, Position, Width);
             }
 
             protected readonly PeripheralRegister parent;

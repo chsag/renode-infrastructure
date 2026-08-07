@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2010-2025 Antmicro
+// Copyright (c) 2010-2026 Antmicro
 //
 // This file is licensed under the MIT License.
 // Full license text is available in 'licenses/MIT.txt'.
@@ -24,6 +24,18 @@ using static Antmicro.Renode.Peripherals.Bus.WindowMMUBusController;
 
 namespace Antmicro.Renode.Peripherals.MemoryControllers
 {
+    // Currently not implemented or partially implemented features:
+    // * Translation faults when address is out of range of TSZ
+    // * Granule sizes other than 4 KiB
+    // * Storing TLBs based on VMID/ASID instead of just the bus controller
+    // * Stage 2 translation and support for the remaining STE.Config values
+    // * -AE registers (Functional Safety features)
+    // * Support for more invalidation commands (e.g. CMD_TLBI_NSNH_ALL, CMD_TLBI_SNH_ALL)
+    // * Support for all STE.PRIVCFG values (i.e. UseIncomming)
+    // * MMIO access control with the IMP_PERIPHPREGIONR register (access to SMMU registers - they are currently always available)
+    // * 2-level stream table
+    // * MSI interrupts
+    // * Stall fault model
     public partial class ARM_SMMUv3 : IPeripheralContainer<IPeripheral, ARM_SMMUv3RegistrationPoint>, IDoubleWordPeripheral, IQuadWordPeripheral,
         IProvidesRegisterCollection<DoubleWordRegisterCollection>, IProvidesRegisterCollection<QuadWordRegisterCollection>, IKnownSize
     {
@@ -47,6 +59,7 @@ namespace Antmicro.Renode.Peripherals.MemoryControllers
             QuadWordRegisters = new QuadWordRegisterCollection(this);
             nonSecureDomain = new Domain(this, SecurityState.NonSecure);
             secureDomain = new Domain(this, SecurityState.Secure);
+            CommandSyncIRQ = new GPIO();
             DefineRegisters();
             // Queues expect I(Flag|Value)RegisterField values to be already initialized
             // so queues have to be created after defining the registers
@@ -156,18 +169,42 @@ namespace Antmicro.Renode.Peripherals.MemoryControllers
             machine.UnregisterAsAChildOf(this, peripheral);
         }
 
-        public MMUWindow GetWindowFromPageTable(ulong address, IPeripheral initiator)
+        public MMUWindow GetWindowFromPageTable(ulong address, IPeripheral initiator, AccessType accessType)
         {
             if(!streams.TryGetValue(initiator, out var registration))
             {
-                this.WarningLog("No stream for context {0}", initiator);
+                this.ErrorLog("Initiator '{0}' is not an SMMU stream", initiator);
                 return null;
             }
             var streamId = registration.Stream;
             var domain = SelectDomain(registration);
+            if(streamId < 0 || streamId >= domain.StreamTable.Length)
+            {
+                this.WarningLog("Stream #{0} is out of range of [0;{1})", streamId, domain.StreamTable.Length);
+                domain.SignalEvent(new EventBadStreamId
+                {
+                    StreamID = (uint)streamId,
+                    // TODO: Substream ID
+                });
+                return null;
+            }
+
             var ste = domain.StreamTable[streamId];
+
+            if(!ste.V)
+            {
+                this.WarningLog("Stream configuration #{0} ({1}) is invalid", streamId, domain.SecurityState);
+                domain.SignalEvent(new EventBadSTE
+                {
+                    StreamID = (uint)streamId,
+                    // TODO: Substream ID
+                });
+                return null;
+            }
+
             if(ste.Config == StreamConfiguration.Abort)
             {
+                // For abort configurations (0b000) - 'Report abort to device, no event recorded.' (5.2 Config, bits [3:1])
                 return null;
             }
             if(ste.Config == StreamConfiguration.Bypass)
@@ -183,6 +220,17 @@ namespace Antmicro.Renode.Peripherals.MemoryControllers
                 return win;
             }
             var cd = ReadStruct<ContextDescriptor>(ste.S1ContextPtr);
+            if(!cd.V)
+            {
+                this.WarningLog("Context descriptor for stream #{0} ({1}) loaded from 0x{2:X} is invalid", streamId, domain.SecurityState, ste.S1ContextPtr);
+                domain.SignalEvent(new EventBadCD
+                {
+                    StreamID = (uint)streamId,
+                    // TODO: Substream ID
+                });
+                return null;
+            }
+
             // TODO: treating UseIncoming as Privileged
             var privileged = ste.PRIVCFG != Privilege.Unprivileged;
 
@@ -194,6 +242,11 @@ namespace Antmicro.Renode.Peripherals.MemoryControllers
             if(!GetFirstPageTableLevel(vaBits, cd.GetPageSizeShiftForVa(address), out var firstLevel))
             {
                 this.WarningLog("Could not establish a page size shift for CD: {0}", cd.ToDebugString());
+                domain.SignalEvent(new EventBadCD
+                {
+                    StreamID = (uint)streamId,
+                    // TODO: Substream ID
+                }, record: cd.R);
                 return null;
             }
 
@@ -203,6 +256,11 @@ namespace Antmicro.Renode.Peripherals.MemoryControllers
                 if(!maybeTp.HasValue)
                 {
                     this.WarningLog("Translation failed for address 0x{0:x} at level {1}", address, level);
+                    domain.SignalEvent(new EventBadCD
+                    {
+                        StreamID = (uint)streamId,
+                        // TODO: Substream ID
+                    }, record: cd.R);
                     return null;
                 }
                 var tp = maybeTp.Value;
@@ -213,11 +271,28 @@ namespace Antmicro.Renode.Peripherals.MemoryControllers
                     {
                         this.WarningLog("Translation failed for address 0x{0:x}: block entry allowed on level 1 only with 4K pages, but we have {1}B",
                             address, Misc.NormalizeBinary(1 << tp.PageSizeShift));
+                        domain.SignalEvent(new EventBadCD
+                        {
+                            StreamID = (uint)streamId,
+                            // TODO: Substream ID
+                        }, record: cd.R);
                         return null;
                     }
                     if(level > 2)
                     {
                         this.WarningLog("Translation failed for address 0x{0:x}: invalid block descriptor at level {1}", address, level);
+                        domain.SignalEvent(new EventTranslation
+                        {
+                            StreamID = (uint)streamId,
+                            Privileged = privileged,
+                            // Execute access also implies a read access
+                            ReadOrWrite = accessType == AccessType.Read || accessType == AccessType.Execute,
+                            InstructionOrData = accessType == AccessType.Execute,
+                            NonSecureIPA = true,
+                            Class = OperationClass.InputAddress,
+                            InputAddress = address,
+                            // TODO: Substream ID, stage 2 values
+                        }, record: cd.R);
                         return null;
                     }
 
@@ -244,7 +319,18 @@ namespace Antmicro.Renode.Peripherals.MemoryControllers
                         var virt = address & mask;
                         if(!(table.GetOutputAddress(vmsa32: !cd.AA64) is ulong phys))
                         {
-                            // TODO: Implement the address size fault event
+                            domain.SignalEvent(new EventAddressSize
+                            {
+                                StreamID = (uint)streamId,
+                                Privileged = privileged,
+                                // Execute access also implies a read access
+                                ReadOrWrite = accessType == AccessType.Read || accessType == AccessType.Execute,
+                                InstructionOrData = accessType == AccessType.Execute,
+                                NonSecureIPA = true,
+                                Class = OperationClass.TranslationTable,
+                                InputAddress = address,
+                                // TODO: Substream ID, stage 2 values
+                            }, record: cd.R);
                             return null;
                         }
                         phys = phys << tp.PageSizeShift;
@@ -261,7 +347,18 @@ namespace Antmicro.Renode.Peripherals.MemoryControllers
 
                     if(!(table.GetOutputAddress(vmsa32: !cd.AA64) is ulong nextTable))
                     {
-                        // TODO: Implement the address size fault event
+                        domain.SignalEvent(new EventAddressSize
+                        {
+                            StreamID = (uint)streamId,
+                            Privileged = privileged,
+                            // Execute access also implies a read access
+                            ReadOrWrite = accessType == AccessType.Read || accessType == AccessType.Execute,
+                            InstructionOrData = accessType == AccessType.Execute,
+                            NonSecureIPA = true,
+                            Class = OperationClass.TranslationTable,
+                            InputAddress = address,
+                            // TODO: Substream ID, stage 2 values
+                        }, record: cd.R);
                         return null;
                     }
                     tableAddr = nextTable << tp.PageSizeShift;
@@ -269,11 +366,65 @@ namespace Antmicro.Renode.Peripherals.MemoryControllers
                 else
                 {
                     this.WarningLog("Translation failed for address 0x{0:x}: invalid PTE at level {1}: {2} @ 0x{3:x}", address, level, pte, tp.TableAddress);
+                    domain.SignalEvent(new EventTranslation
+                    {
+                        StreamID = (uint)streamId,
+                        Privileged = privileged,
+                        // Execute access also implies a read access
+                        ReadOrWrite = accessType == AccessType.Read || accessType == AccessType.Execute,
+                        InstructionOrData = accessType == AccessType.Execute,
+                        NonSecureIPA = true,
+                        Class = OperationClass.InputAddress,
+                        InputAddress = address,
+                        // TODO: Substream ID, stage 2 values
+                    }, record: cd.R);
                     return null;
                 }
             }
             throw new Exception("Unreachable");
         }
+
+        public void SignalPermissionFaultEvent(IPeripheral initiator, ulong address, AccessType accessType)
+        {
+            if(!streams.TryGetValue(initiator, out var registration))
+            {
+                this.ErrorLog("Could not get a domain for peripheral: {0}; permission fault event will not be recorded", initiator);
+                return;
+            }
+
+            SelectDomain(registration).SignalEvent(new EventPermission
+            {
+                StreamID = (uint)registration.Stream,
+                // Execute access also implies a read access
+                ReadOrWrite = accessType == AccessType.Read || accessType == AccessType.Execute,
+                InstructionOrData = accessType == AccessType.Execute,
+                NonSecureIPA = true,
+                Class = OperationClass.InputAddress,
+                InputAddress = address,
+                // TODO: Substream ID, stage 2 values
+            });
+        }
+
+        public IDisposable BlockEventQueues(bool block)
+        {
+            nonSecureDomain.BlockEventQueue = block;
+            secureDomain.BlockEventQueue = block;
+            return DisposableWrapper.New(() =>
+            {
+                nonSecureDomain.BlockEventQueue = false;
+                secureDomain.BlockEventQueue = false;
+            });
+        }
+
+        public GPIO NonSecureGlobalErrorIRQ => nonSecureDomain.GlobalErrorIRQ;
+
+        public GPIO SecureGlobalErrorIRQ => secureDomain.GlobalErrorIRQ;
+
+        public GPIO CommandSyncIRQ { get; }
+
+        public GPIO NonSecureEventQueueIRQ => nonSecureDomain.EventQueueIRQ;
+
+        public GPIO SecureEventQueueIRQ => secureDomain.EventQueueIRQ;
 
         public long Size => 0x24000;
 
@@ -394,7 +545,7 @@ namespace Antmicro.Renode.Peripherals.MemoryControllers
                 .WithValueField(0, 6, FieldMode.Read, valueProviderCallback: _ => StreamIdBits, name: "SIDSIZE")
                 .WithValueField(6, 5, FieldMode.Read, valueProviderCallback: _ => 0, name: "SSIDSIZE")
                 .WithValueField(11, 5, FieldMode.Read, valueProviderCallback: _ => 7, name: "PRIQS")
-                .WithValueField(16, 5, FieldMode.Read, valueProviderCallback: _ => 7, name: "EVENTQS")
+                .WithValueField(16, 5, FieldMode.Read, valueProviderCallback: _ => MaxEventQueueShift, name: "EVENTQS")
                 .WithValueField(21, 5, FieldMode.Read, valueProviderCallback: _ => MaxCommandQueueShift, name: "CMDQS")
                 .WithFlag(26, FieldMode.Read, valueProviderCallback: _ => false, name: "ATTR_PERMS_OVR")
                 .WithFlag(27, FieldMode.Read, valueProviderCallback: _ => false, name: "ATTR_TYPES_OVR")
@@ -483,7 +634,7 @@ namespace Antmicro.Renode.Peripherals.MemoryControllers
             Registers.SMMU_CR0.Define(this)
                 .WithFlag(0, out var smmuEnable, changeCallback: (_, val) => nonSecureDomain.Enabled = val, name: "SMMUEN")
                 .WithFlag(1, out var pageRequestQueueEnable, name: "PRIQEN")
-                .WithFlag(2, out var eventQueueEnable, name: "EVENTQEN")
+                .WithFlag(2, out nonSecureDomain.EventQueueEnable, name: "EVENTQEN")
                 .WithFlag(3, out var commandQueueEnable, name: "CMDQEN")
                 .WithFlag(4, out var atsCheckEnable, name: "ATSCHK")
                 .WithReservedBits(5, 1)
@@ -496,7 +647,7 @@ namespace Antmicro.Renode.Peripherals.MemoryControllers
             Registers.SMMU_CR0ACK.Define(this)
                 .WithFlag(0, FieldMode.Read, valueProviderCallback: _ => smmuEnable.Value, name: "SMMUEN_ACK")
                 .WithFlag(1, FieldMode.Read, valueProviderCallback: _ => pageRequestQueueEnable.Value, name: "PRIQEN_ACK")
-                .WithFlag(2, FieldMode.Read, valueProviderCallback: _ => eventQueueEnable.Value, name: "EVENTQEN_ACK")
+                .WithFlag(2, FieldMode.Read, valueProviderCallback: _ => nonSecureDomain.EventQueueEnable.Value, name: "EVENTQEN_ACK")
                 .WithFlag(3, FieldMode.Read, valueProviderCallback: _ => commandQueueEnable.Value, name: "CMDQEN_ACK")
                 .WithFlag(4, FieldMode.Read, valueProviderCallback: _ => atsCheckEnable.Value, name: "ATSCHK_ACK")
             ;
@@ -513,7 +664,7 @@ namespace Antmicro.Renode.Peripherals.MemoryControllers
 
             Registers.SMMU_CR2.Define(this)
                 .WithTaggedFlag("E2H", 0)
-                .WithTaggedFlag("RECINVSID", 1)
+                .WithFlag(1, FieldMode.Read, valueProviderCallback: _ => true, name: "RECINVSID")
                 .WithTaggedFlag("PTM", 2)
                 .WithTaggedFlag("REC_CFG_ATS", 3)
                 .WithReservedBits(4, 28)
@@ -559,6 +710,7 @@ namespace Antmicro.Renode.Peripherals.MemoryControllers
                 .WithFlag(1, out pageRequestQueueErrorInterruptEnable, name: "PRIQ_IRQEN")
                 .WithFlag(2, out nonSecureDomain.EventQueueInterruptEnable, name: "EVENTQ_IRQEN")
                 .WithReservedBits(3, 29)
+                .WithWriteCallback((_, __) => nonSecureDomain.UpdateInterrupts())
             ;
 
             Registers.SMMU_IRQ_CTRLACK.Define(this)
@@ -581,6 +733,7 @@ namespace Antmicro.Renode.Peripherals.MemoryControllers
                 .WithTaggedFlag("CMDQP_ERR", 9)
                 .WithTaggedFlag("DPT_ERR", 10)
                 .WithReservedBits(11, 21)
+                .WithWriteCallback((_, __) => nonSecureDomain.UpdateInterrupts())
             ;
 
             Registers.SMMU_GERRORN.Define(this)
@@ -687,9 +840,15 @@ namespace Antmicro.Renode.Peripherals.MemoryControllers
             ;
 
             QuadWordRegisters.DefineRegister((long)Registers.SMMU_EVENTQ_BASE)
-                .WithTag("LOG2SIZE", 0, 5)
+                .WithValueField(0, 5, out nonSecureDomain.EventQueueShift, name: "LOG2SIZE", changeCallback: (_, val) =>
+                    {
+                        if(val > MaxEventQueueShift)
+                        {
+                            nonSecureDomain.EventQueueShift.Value = MaxEventQueueShift;
+                        }
+                    })
                 .WithReservedBits(56, 6)
-                .WithTag("ADDR", 5, 51)
+                .WithValueField(5, 51, out nonSecureDomain.EventQueueAddress, name: "ADDR")
                 .WithTaggedFlag("WA", 62)
                 .WithReservedBits(63, 1)
             ;
@@ -834,15 +993,15 @@ namespace Antmicro.Renode.Peripherals.MemoryControllers
             ;
 
             Registers.SMMU_EVENTQ_PROD.Define(this)
-                .WithTag("WR", 0, 20)
+                .WithValueField(0, 20, out nonSecureDomain.EventQueueProduce, FieldMode.Read)
                 .WithReservedBits(20, 11)
-                .WithTaggedFlag("OVFLG", 31)
+                .WithFlag(31, out nonSecureDomain.EventQueueOverflow, FieldMode.Read, name: "OVFLG")
             ;
 
             Registers.SMMU_EVENTQ_CONS.Define(this)
-                .WithTag("RD", 0, 20)
+                .WithValueField(0, 20, out nonSecureDomain.EventQueueConsume)
                 .WithReservedBits(20, 11)
-                .WithTaggedFlag("OVACKFLG", 31)
+                .WithFlag(31, out nonSecureDomain.EventQueueOverflowAcknowledge, name: "OVACKFLG")
             ;
 
             if(priSupported)
@@ -932,7 +1091,7 @@ namespace Antmicro.Renode.Peripherals.MemoryControllers
             Registers.SMMU_S_CR0.Define(this)
                 .WithFlag(0, out var smmuEnableSecure, changeCallback: (_, val) => secureDomain.Enabled = val, name: "SMMUEN")
                 .WithReservedBits(1, 1)
-                .WithFlag(2, out var eventQueueEnableSecure, name: "EVENTQEN")
+                .WithFlag(2, out secureDomain.EventQueueEnable, name: "EVENTQEN")
                 .WithFlag(3, out var commandQueueEnableSecure, name: "CMDQEN")
                 .WithReservedBits(4, 1)
                 .WithFlag(5, out var secureInstructionFetchEnabled, name: "SIF")
@@ -944,13 +1103,20 @@ namespace Antmicro.Renode.Peripherals.MemoryControllers
             Registers.SMMU_S_CR0ACK.Define(this)
                 .WithFlag(0, FieldMode.Read, valueProviderCallback: _ => smmuEnableSecure.Value, name: "SMMUEN_ACK")
                 .WithReservedBits(1, 1)
-                .WithFlag(2, FieldMode.Read, valueProviderCallback: _ => eventQueueEnableSecure.Value, name: "EVENTQEN_ACK")
+                .WithFlag(2, FieldMode.Read, valueProviderCallback: _ => secureDomain.EventQueueEnable.Value, name: "EVENTQEN_ACK")
                 .WithFlag(3, FieldMode.Read, valueProviderCallback: _ => commandQueueEnableSecure.Value, name: "CMDQEN_ACK")
                 .WithReservedBits(4, 1)
                 .WithFlag(5, FieldMode.Read, valueProviderCallback: _ => secureInstructionFetchEnabled.Value, name: "SIF")
                 .WithTag("VMW", 6, 3)
                 .WithTaggedFlag("NSSTALLD", 9)
                 .WithReservedBits(10, 22)
+            ;
+
+            Registers.SMMU_S_CR2.Define(this)
+                .WithTaggedFlag("E2H", 0)
+                .WithFlag(1, FieldMode.Read, valueProviderCallback: _ => true, name: "RECINVSID")
+                .WithTaggedFlag("PTM", 2)
+                .WithReservedBits(3, 29)
             ;
 
             Registers.SMMU_S_INIT.Define(this)
@@ -978,6 +1144,7 @@ namespace Antmicro.Renode.Peripherals.MemoryControllers
                 .WithReservedBits(1, 1)
                 .WithFlag(2, out secureDomain.EventQueueInterruptEnable, name: "EVENTQ_IRQEN")
                 .WithReservedBits(3, 29)
+                .WithWriteCallback((_, __) => secureDomain.UpdateInterrupts())
             ;
 
             Registers.SMMU_S_IRQ_CTRLACK.Define(this)
@@ -999,6 +1166,7 @@ namespace Antmicro.Renode.Peripherals.MemoryControllers
                 .WithTaggedFlag("SFM_ERR", 8)
                 .WithTaggedFlag("CMDQP_ERR", 9)
                 .WithReservedBits(10, 22)
+                .WithWriteCallback((_, __) => secureDomain.UpdateInterrupts())
             ;
 
             QuadWordRegisters.DefineRegister((long)Registers.SMMU_S_STRTAB_BASE)
@@ -1052,6 +1220,32 @@ namespace Antmicro.Renode.Peripherals.MemoryControllers
                 .WithReservedBits(20, 4)
                 .WithEnumField(24, 7, out secureDomain.CommandQueueErrorReason, mode: FieldMode.Read, name: "ERR")
                 .WithReservedBits(31, 1)
+            ;
+
+            QuadWordRegisters.DefineRegister((long)Registers.SMMU_S_EVENTQ_BASE)
+                .WithValueField(0, 5, out secureDomain.EventQueueShift, name: "LOG2SIZE", changeCallback: (_, val) =>
+                    {
+                        if(val > MaxEventQueueShift)
+                        {
+                            secureDomain.EventQueueShift.Value = MaxEventQueueShift;
+                        }
+                    })
+                .WithReservedBits(56, 6)
+                .WithValueField(5, 51, out secureDomain.EventQueueAddress, name: "ADDR")
+                .WithTaggedFlag("WA", 62)
+                .WithReservedBits(63, 1)
+            ;
+
+            Registers.SMMU_S_EVENTQ_PROD.Define(this)
+                .WithValueField(0, 20, out secureDomain.EventQueueProduce, FieldMode.Read)
+                .WithReservedBits(20, 11)
+                .WithFlag(31, out secureDomain.EventQueueOverflow, FieldMode.Read, name: "OVFLG")
+            ;
+
+            Registers.SMMU_S_EVENTQ_CONS.Define(this)
+                .WithValueField(0, 20, out secureDomain.EventQueueConsume)
+                .WithReservedBits(20, 11)
+                .WithFlag(31, out secureDomain.EventQueueOverflowAcknowledge, name: "OVACKFLG")
             ;
         }
 
@@ -1117,6 +1311,7 @@ namespace Antmicro.Renode.Peripherals.MemoryControllers
 
         private const int MaxPageTableLevel = 3;
         private const int MaxCommandQueueShift = 7; // 128 bytes
+        private const int MaxEventQueueShift = 7;
         private const int StreamIdBits = 8;
 
         public enum SecurityState
@@ -1227,8 +1422,8 @@ namespace Antmicro.Renode.Peripherals.MemoryControllers
             SMMU_S_CMDQ_PROD = SMMU_SECURE_BASE | SMMU_CMDQ_PROD,
             SMMU_S_CMDQ_CONS = SMMU_SECURE_BASE | SMMU_CMDQ_CONS,
             SMMU_S_EVENTQ_BASE = SMMU_SECURE_BASE | SMMU_EVENTQ_BASE,
-            SMMU_S_EVENTQ_PROD = SMMU_SECURE_BASE | SMMU_EVENTQ_PROD,
-            SMMU_S_EVENTQ_CONS = SMMU_SECURE_BASE | SMMU_EVENTQ_CONS,
+            SMMU_S_EVENTQ_PROD = SMMU_SECURE_BASE | SMMU_EVENTQ_PROD_Alias,
+            SMMU_S_EVENTQ_CONS = SMMU_SECURE_BASE | SMMU_EVENTQ_CONS_Alias,
             SMMU_S_EVENTQ_IRQ_CFG0 = SMMU_SECURE_BASE | SMMU_EVENTQ_IRQ_CFG0,
             SMMU_S_EVENTQ_IRQ_CFG1 = SMMU_SECURE_BASE | SMMU_EVENTQ_IRQ_CFG1,
             SMMU_S_EVENTQ_IRQ_CFG2 = SMMU_SECURE_BASE | SMMU_EVENTQ_IRQ_CFG2,

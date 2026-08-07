@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2010-2025 Antmicro
+// Copyright (c) 2010-2026 Antmicro
 // Copyright (c) 2011-2015 Realtime Embedded
 //
 // This file is licensed under the MIT License.
@@ -9,35 +9,53 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 
+using Antmicro.Renode.Exceptions;
 using Antmicro.Renode.Utilities;
 
 namespace Antmicro.Renode.Peripherals.Bus.Wrappers
 {
     public class RegisterMapper
     {
-        public RegisterMapper(Type peripheralType)
+        public RegisterMapper(Type type, string tag = null)
         {
+            if(type.IsEnum)
+            {
+                RegisterEnumMapping(type);
+                return;
+            }
+
+            var peripheralType = type;
             var types = peripheralType.GetAllNestedTypes();
             var interestingEnums = new List<Type>();
 
-            var enumsWithAttribute = types.Where(t => t.GetCustomAttributes(false).Any(x => x is RegistersDescriptionAttribute));
+            var enumsWithAttribute = types.Where(t => t.GetCustomAttributes(false).Any(x => x is RegistersDescriptionAttribute attr && attr.Tag == tag));
             if(enumsWithAttribute != null)
             {
                 interestingEnums.AddRange(enumsWithAttribute);
             }
             interestingEnums.AddRange(types.Where(t => t.BaseType == typeof(Enum) && t.Name.IndexOf("register", StringComparison.CurrentCultureIgnoreCase) != -1));
 
-            foreach(var type in interestingEnums)
+            foreach(var interestingEnum in interestingEnums)
             {
-                foreach(var value in type.GetEnumValues())
-                {
-                    var l = Convert.ToInt64(value);
-                    var s = Enum.GetName(type, value);
+                RegisterEnumMapping(interestingEnum);
+            }
+        }
 
-                    if(!map.ContainsKey(l))
-                    {
-                        map.Add(l, s);
-                    }
+        public void RegisterEnumMapping(Type @enum)
+        {
+            if(!@enum.IsEnum)
+            {
+                throw new RecoverableException("@enum parameter must be an enum type");
+            }
+
+            foreach(var value in @enum.GetEnumValues())
+            {
+                var l = Convert.ToInt64(value);
+                var s = Enum.GetName(@enum, value);
+
+                if(!map.ContainsKey(l))
+                {
+                    map.Add(l, s);
                 }
             }
         }
@@ -69,6 +87,14 @@ namespace Antmicro.Renode.Peripherals.Bus.Wrappers
         private readonly Dictionary<long, string> map = new Dictionary<long, string>();
 
         [AttributeUsage(AttributeTargets.Enum)]
-        public class RegistersDescriptionAttribute : Attribute { }
+        public class RegistersDescriptionAttribute : Attribute
+        {
+            public RegistersDescriptionAttribute(string tag = null)
+            {
+                Tag = tag;
+            }
+
+            public string Tag { get; }
+        }
     }
 }

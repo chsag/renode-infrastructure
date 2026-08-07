@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2010-2018 Antmicro
+// Copyright (c) 2010-2026 Antmicro
 // Copyright (c) 2011-2015 Realtime Embedded
 //
 // This file is licensed under the MIT License.
@@ -102,11 +102,12 @@ namespace Antmicro.Renode.Extensions.Analyzers.Video
             lock(imgLock)
             {
                 var pixelFormat = PixelFormat.RGBA8888;
-#if PLATFORM_WINDOWS
-                pixelFormat = PixelFormat.BGRA8888;
-#endif
+                if(RuntimeInfo.IsWindows())
+                {
+                    pixelFormat = PixelFormat.BGRA8888;
+                }
                 converter = PixelManipulationTools.GetConverter(colorFormat, endianess, pixelFormat, Endianess.BigEndian, desiredWidth, desiredHeight);
-                outBuffer = new byte[desiredWidth * desiredHeight * pixelFormat.GetColorDepth()];
+                outBuffer = new byte[pixelFormat.GetByteCount((ulong)(desiredWidth * desiredHeight))];
 
                 img = new ImageBuilder(DesiredDisplayWidth, DesiredDisplayHeight).ToBitmap();
                 drawMethod = CalculateDrawMethod();

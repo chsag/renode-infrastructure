@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2010-2025 Antmicro
+// Copyright (c) 2010-2026 Antmicro
 // Copyright (c) 2011-2015 Realtime Embedded
 //
 // This file is licensed under the MIT License.
@@ -16,39 +16,63 @@ using Antmicro.Renode.Exceptions;
 using Antmicro.Renode.Logging;
 using Antmicro.Renode.Utilities;
 
+using ELFSharp.ELF;
+
 namespace Antmicro.Renode.Peripherals.CPU.Disassembler
 {
-    public class LLVMDisassembler : IDisassembler
+    public class LLVMDisassembler
     {
-        public LLVMDisassembler(ICPU cpu)
+        public static void ValidateTriple(ICPUSupportingLLVMDisas cpu, ref string triple)
         {
-            if(!LLVMArchitectureMapping.IsSupported(cpu))
+            if(triple == null)
             {
-                throw new ArgumentOutOfRangeException("cpu");
+                triple = cpu.AllLLVMTriples[0];
+                return;
             }
-
-            this.cpu = cpu;
-            cache = new Dictionary<string, IDisassembler>();
+            if(Array.IndexOf(cpu.AllLLVMTriples, triple) == -1)
+            {
+                throw new RecoverableException($"Invalid triple {triple} for CPU. Supported triples are: {String.Join(", ", cpu.AllLLVMTriples)}");
+            }
         }
 
-        public bool TryDisassembleInstruction(ulong pc, byte[] data, uint flags, out DisassemblyResult result, int memoryOffset = 0)
+        public LLVMDisassembler(ICPUSupportingLLVMDisas cpu)
         {
-            return GetDisassembler(flags).TryDisassembleInstruction(pc, data, flags, out result, memoryOffset);
+            this.cpu = cpu;
+            cache = new Dictionary<string, IFlaglessDisassembler>();
+        }
+
+        public bool TryDisassembleInstruction(ulong pc, byte[] data, uint flags, bool alternateDialect, out DisassemblyResult result, int memoryOffset = 0)
+        {
+            return GetDisassembler(flags, alternateDialect).TryDisassembleInstruction(pc, data, out result, memoryOffset);
         }
 
         public bool TryDecodeInstruction(ulong pc, byte[] memory, uint flags, out byte[] opcode, int memoryOffset = 0)
         {
-            return GetDisassembler(flags).TryDecodeInstruction(pc, memory, flags, out opcode, memoryOffset);
+            return GetDisassembler(flags, false).TryDecodeInstruction(pc, memory, out opcode, memoryOffset);
         }
 
-        public int DisassembleBlock(ulong pc, byte[] memory, uint flags, out string text)
+        public int DisassembleBlock(ulong pc, byte[] memory, string triple, bool alternateDialect, out string text)
+        {
+            var disas = GetDisassembler(triple, alternateDialect);
+            return DisassembleBlockInner(disas, pc, memory, out text);
+        }
+
+        public int DisassembleBlock(ulong pc, byte[] memory, uint flags, bool alternateDialect, out string text)
+        {
+            var disas = GetDisassembler(flags, alternateDialect);
+            return DisassembleBlockInner(disas, pc, memory, out text);
+        }
+
+        private static bool xtensaSupportWarningIssued = false;
+
+        private int DisassembleBlockInner(IFlaglessDisassembler disas, ulong pc, byte[] memory, out string text)
         {
             var sofar = 0;
             var strBldr = new StringBuilder();
 
             while(sofar < (int)memory.Length)
             {
-                if(!TryDisassembleInstruction(pc, memory, flags, out var result, memoryOffset: sofar))
+                if(!disas.TryDisassembleInstruction(pc, memory, out var result, memoryOffset: sofar))
                 {
                     strBldr.AppendFormat("Disassembly error detected. The rest of the output ({0}) will be truncated.", memory.Skip(sofar).ToLazyHexString());
                     break;
@@ -72,16 +96,16 @@ namespace Antmicro.Renode.Peripherals.CPU.Disassembler
             return sofar;
         }
 
-        private static bool xtensaSupportWarningIssued = false;
-
-        private IDisassembler GetDisassembler(uint flags)
+        private IFlaglessDisassembler GetDisassembler(string triple, bool alternateDialect)
         {
-            LLVMArchitectureMapping.GetTripleAndModelKey(cpu, ref flags, out var triple, out var model);
-            var key = $"{triple} {model} {flags}";
+            ValidateTriple(cpu, ref triple);
+            var model = cpu.LLVMModel;
+
+            var key = $"{triple} {model} {alternateDialect} {cpu.DisassemblyHexFormatting}";
             if(!cache.ContainsKey(key))
             {
-                IDisassembler disas = new LLVMDisasWrapper(model, triple, flags);
-                Logger.Info($"Created new disassembler for triple {triple}, cpu {model}, with flags {flags}");
+                IFlaglessDisassembler disas = new LLVMDisasWrapper(model, triple, alternateDialect, cpu.DisassemblyHexFormatting);
+                Logger.Info($"Created new disassembler for triple {triple}, cpu {model}{(alternateDialect ? " with alternate dialect" : "")}");
                 if(!xtensaSupportWarningIssued && triple == "xtensa")
                 {
                     Logger.Log(LogLevel.Warning, "The disassembler for Xtensa is currently an experimental feature in Renode");
@@ -102,25 +126,34 @@ namespace Antmicro.Renode.Peripherals.CPU.Disassembler
             return cache[key];
         }
 
-        private readonly Dictionary<string, IDisassembler> cache;
-        private readonly ICPU cpu;
-
-        private class LLVMDisasWrapper : IDisposable, IDisassembler
+        private IFlaglessDisassembler GetDisassembler(uint translationFlags, bool alternateDialect)
         {
-            public LLVMDisasWrapper(string cpu, string triple, uint flags)
+            var triple = cpu.GetLLVMTriple(translationFlags);
+            return GetDisassembler(triple, alternateDialect);
+        }
+
+        private readonly Dictionary<string, IFlaglessDisassembler> cache;
+        private readonly ICPUSupportingLLVMDisas cpu;
+
+        private class LLVMDisasWrapper : IDisposable, IFlaglessDisassembler
+        {
+            public LLVMDisasWrapper(string cpu, string triple, bool alternateDialect, Endianess hexFormatting)
             {
                 try
                 {
-                    context = llvm_create_disasm_cpu_with_flags(triple, cpu, flags);
+                    if(LLVMDisasBindings.LlvmCreateDisasmCpuWithFlags == null)
+                    {
+                        Logger.Warning("Old version of libllvm-disas is in use, unable to specify disassembly flags");
+                        context = LLVMDisasBindings.LlvmCreateDisasmCpu(triple, cpu);
+                    }
+                    else
+                    {
+                        context = LLVMDisasBindings.LlvmCreateDisasmCpuWithFlags(triple, cpu, alternateDialect ? 1 : 0u);
+                    }
                 }
-                catch(DllNotFoundException)
+                catch(ConstructionException)
                 {
                     throw new RecoverableException("Could not find libllvm-disas. Please check in current output directory.");
-                }
-                catch(EntryPointNotFoundException)
-                {
-                    context = llvm_create_disasm_cpu(triple, cpu);
-                    Logger.Warning("Old version of libllvm-disas is in use, unable to specify disassembly flags");
                 }
                 if(context == IntPtr.Zero)
                 {
@@ -128,47 +161,25 @@ namespace Antmicro.Renode.Peripherals.CPU.Disassembler
                 }
                 isThumb = triple.Contains("thumb");
 
-                switch(triple)
-                {
-                case "ppc":
-                case "ppc64le":
-                case "sparc":
-                case "i386":
-                case "x86_64":
-                case "xtensa":
-                    HexFormatter = FormatHexForx86;
-                    break;
-                case "riscv64":
-                case "riscv32":
-                case "thumb":
-                case "arm":
-                case "armv7a":
-                case "arm64":
-                case "msp430":
-                case "msp430x":
-                    HexFormatter = FormatHexForARM;
-                    break;
-                default:
-                    throw new ArgumentOutOfRangeException("cpu", "CPU not supported.");
-                }
+                HexEndianess = hexFormatting;
             }
 
             public void Dispose()
             {
                 if(context != IntPtr.Zero)
                 {
-                    llvm_disasm_dispose(context);
+                    LLVMDisasBindings.LlvmDisasmDispose(context);
                 }
             }
 
-            public bool TryDisassembleInstruction(ulong pc, byte[] data, uint flags, out DisassemblyResult result, int memoryOffset = 0)
+            public bool TryDisassembleInstruction(ulong pc, byte[] data, out DisassemblyResult result, int memoryOffset = 0)
             {
                 var strBuf = Marshal.AllocHGlobal(1024);
                 var marshalledData = Marshal.AllocHGlobal(data.Length - memoryOffset);
 
                 Marshal.Copy(data, memoryOffset, marshalledData, data.Length - memoryOffset);
 
-                var bytes = llvm_disasm_instruction(context, marshalledData, (ulong)(data.Length - memoryOffset), strBuf, 1024);
+                var bytes = LLVMDisasBindings.LlvmDisasmInstruction(context, marshalledData, (ulong)(data.Length - memoryOffset), strBuf, 1024);
                 if(bytes == 0)
                 {
                     result = default(DisassemblyResult);
@@ -176,7 +187,7 @@ namespace Antmicro.Renode.Peripherals.CPU.Disassembler
                 }
 
                 var strBldr = new StringBuilder();
-                if(!HexFormatter(strBldr, bytes, memoryOffset, data))
+                if(!FormatHex(strBldr, bytes, memoryOffset, data))
                 {
                     result = default(DisassemblyResult);
                     return false;
@@ -186,7 +197,7 @@ namespace Antmicro.Renode.Peripherals.CPU.Disassembler
                 {
                     PC = pc,
                     OpcodeSize = bytes,
-                    OpcodeString = strBldr.ToString().Replace(" ", ""),
+                    OpcodeString = strBldr.ToString(),
                     DisassemblyString = Marshal.PtrToStringAnsi(strBuf)
                 };
 
@@ -195,99 +206,51 @@ namespace Antmicro.Renode.Peripherals.CPU.Disassembler
                 return true;
             }
 
-            public bool TryDecodeInstruction(ulong pc, byte[] memory, uint flags, out byte[] opcode, int memoryOffset = 0)
+            public bool TryDecodeInstruction(ulong pc, byte[] memory, out byte[] opcode, int memoryOffset = 0)
             {
-                if(!TryDisassembleInstruction(pc, memory, flags, out var result, memoryOffset))
+                if(!TryDisassembleInstruction(pc, memory, out var result, memoryOffset))
                 {
                     opcode = new byte[0];
                     return false;
                 }
 
-                opcode = Misc.HexStringToByteArray(result.OpcodeString.Trim(), true);
+                opcode = new byte[result.OpcodeSize];
+                Array.Copy(memory, memoryOffset, opcode, 0, result.OpcodeSize);
                 return true;
             }
 
-            [DllImport("libllvm-disas")]
-            private static extern int llvm_disasm_instruction(IntPtr dc, IntPtr bytes, UInt64 bytesSize, IntPtr outString, UInt32 outStringSize);
-
-            [DllImport("libllvm-disas")]
-            private static extern IntPtr llvm_create_disasm_cpu_with_flags(string tripleName, string cpu, uint flags);
-
-            // Fallback in case a new version of Renode is used with an old version of libllvm-disas
-            [DllImport("libllvm-disas")]
-            private static extern IntPtr llvm_create_disasm_cpu(string tripleName, string cpu);
-
-            [DllImport("libllvm-disas")]
-            private static extern void llvm_disasm_dispose(IntPtr disasm);
-
-            private bool FormatHexForx86(StringBuilder strBldr, int bytes, int position, byte[] data)
+            private bool FormatHex(StringBuilder strBldr, int bytes, int position, byte[] data)
             {
-                int i;
-                for(i = 0; i < bytes && position + i < data.Length; i++)
+                if(isThumb && bytes == 4)
                 {
-                    strBldr.AppendFormat("{0:x2} ", data[position + i]);
+                    return FormatHex(strBldr, 2, position, data) && FormatHex(strBldr, 2, position + 2, data);
                 }
+                if(position > data.Length - bytes) return false;
 
-                //This is a sane minimal length, based on some different binaries for quark.
-                //X86 instructions do not have the upper limit of lenght, so we have to approximate.
-                for(var j = i; j < 7; ++j)
+                for(int offset = 0; offset < bytes; offset += 1)
                 {
-                    strBldr.Append("   ");
-                }
-
-                return i == bytes;
-            }
-
-            private bool FormatHexForARM(StringBuilder strBldr, int bytes, int position, byte[] data)
-            {
-                if(isThumb)
-                {
-                    if(bytes == 4 && position + 3 < data.Length)
-                    {
-                        strBldr.AppendFormat("{0:x2}{1:x2} {2:x2}{3:x2}", data[position + 1], data[position], data[position + 3], data[position + 2]);
-                    }
-                    else if(bytes == 2 && position + 1 < data.Length)
-                    {
-                        strBldr.AppendFormat("{0:x2}{1:x2}     ", data[position + 1], data[position]);
-                    }
-                    else
-                    {
-                        return false;
-                    }
-                }
-                else
-                {
-                    for(int i = bytes - 1; i >= 0; i--)
-                    {
-                        if(position + i < data.Length)
-                        {
-                            strBldr.AppendFormat("{0:x2}", data[position + i]);
-                        }
-                        else
-                        {
-                            return false;
-                        }
-                    }
+                    var bytePos = HexEndianess == Endianess.BigEndian ? offset : bytes - offset - 1;
+                    strBldr.AppendFormat("{0:x2}", data[position + bytePos]);
                 }
 
                 return true;
             }
 
-            private readonly Func<StringBuilder, int, int, byte[], bool> HexFormatter;
+            private readonly Endianess HexEndianess;
 
             private readonly bool isThumb;
 
             private readonly IntPtr context;
         }
 
-        private class CortexMDisassemblerWrapper : IDisassembler
+        private class CortexMDisassemblerWrapper : IFlaglessDisassembler
         {
-            public CortexMDisassemblerWrapper(IDisassembler actualDisassembler)
+            public CortexMDisassemblerWrapper(IFlaglessDisassembler actualDisassembler)
             {
                 underlyingDisassembler = actualDisassembler;
             }
 
-            public bool TryDisassembleInstruction(ulong pc, byte[] memory, uint flags, out DisassemblyResult result, int memoryOffset = 0)
+            public bool TryDisassembleInstruction(ulong pc, byte[] memory, out DisassemblyResult result, int memoryOffset = 0)
             {
                 switch(pc)
                 {
@@ -358,33 +321,34 @@ namespace Antmicro.Renode.Peripherals.CPU.Disassembler
                     };
                     return true;
                 default:
-                    return underlyingDisassembler.TryDisassembleInstruction(pc, memory, flags, out result, memoryOffset);
+                    return underlyingDisassembler.TryDisassembleInstruction(pc, memory, out result, memoryOffset);
                 }
             }
 
-            public bool TryDecodeInstruction(ulong pc, byte[] memory, uint flags, out byte[] opcode, int memoryOffset = 0)
+            public bool TryDecodeInstruction(ulong pc, byte[] memory, out byte[] opcode, int memoryOffset = 0)
             {
-                if(!TryDisassembleInstruction(pc, memory, flags, out var result, memoryOffset))
+                if(!TryDisassembleInstruction(pc, memory, out var result, memoryOffset))
                 {
                     opcode = new byte[0];
                     return false;
                 }
 
-                opcode = Misc.HexStringToByteArray(result.OpcodeString, true);
+                opcode = new byte[result.OpcodeSize];
+                Array.Copy(memory, memoryOffset, opcode, 0, result.OpcodeSize);
                 return true;
             }
 
-            private readonly IDisassembler underlyingDisassembler;
+            private readonly IFlaglessDisassembler underlyingDisassembler;
         }
 
-        private class RiscVDisassemblerWrapper : IDisassembler
+        private class RiscVDisassemblerWrapper : IFlaglessDisassembler
         {
-            public RiscVDisassemblerWrapper(IDisassembler actualDisassembler)
+            public RiscVDisassemblerWrapper(IFlaglessDisassembler actualDisassembler)
             {
                 underlyingDisassembler = actualDisassembler;
             }
 
-            public bool TryDecodeInstruction(ulong pc, byte[] memory, uint flags, out byte[] opcode, int memoryOffset = 0)
+            public bool TryDecodeInstruction(ulong pc, byte[] memory, out byte[] opcode, int memoryOffset = 0)
             {
                 var opcodeLength = DecodeRiscVOpcodeLength(memory, memoryOffset);
                 if(opcodeLength == 0)
@@ -398,9 +362,9 @@ namespace Antmicro.Renode.Peripherals.CPU.Disassembler
                 return true;
             }
 
-            public bool TryDisassembleInstruction(ulong pc, byte[] data, uint flags, out DisassemblyResult result, int memoryOffset = 0)
+            public bool TryDisassembleInstruction(ulong pc, byte[] data, out DisassemblyResult result, int memoryOffset = 0)
             {
-                return underlyingDisassembler.TryDisassembleInstruction(pc, data, flags, out result, memoryOffset);
+                return underlyingDisassembler.TryDisassembleInstruction(pc, data, out result, memoryOffset);
             }
 
             private int DecodeRiscVOpcodeLength(byte[] memory, int memoryOffset)
@@ -431,7 +395,7 @@ namespace Antmicro.Renode.Peripherals.CPU.Disassembler
                 }
             }
 
-            private readonly IDisassembler underlyingDisassembler;
+            private readonly IFlaglessDisassembler underlyingDisassembler;
         }
     }
 }

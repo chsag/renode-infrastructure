@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2010-2025 Antmicro
+// Copyright (c) 2010-2026 Antmicro
 // Copyright (c) 2011-2015 Realtime Embedded
 //
 // This file is licensed under the MIT License.
@@ -33,7 +33,29 @@ using Antmicro.Renode.Utilities.Collections;
 
 namespace Antmicro.Renode.Logging
 {
-    public class PeripheralLogLevelState : Dictionary<ILoggerBackend, Dictionary<string, Dictionary<string, LogLevel>>> { }
+    public class LoggerState : Dictionary<ILoggerBackend, BackendState> { }
+
+    public class BackendState
+    {
+        public BackendState(LogLevel logLevel)
+        {
+            LogLevel = logLevel;
+            PeripheralsCustomLogLevel = new Dictionary<string, Dictionary<string, LogLevel>>();
+        }
+
+        public void Add(string machineName, string peripheralName, LogLevel logLevel)
+        {
+            if(!PeripheralsCustomLogLevel.TryGetValue(machineName, out var machineDict))
+            {
+                machineDict = new Dictionary<string, LogLevel>();
+                PeripheralsCustomLogLevel[machineName] = machineDict;
+            }
+            machineDict[peripheralName] = logLevel;
+        }
+
+        public readonly LogLevel LogLevel;
+        public readonly IDictionary<string, Dictionary<string, LogLevel>> PeripheralsCustomLogLevel;
+    }
 
     public static class Logger
     {
@@ -429,12 +451,22 @@ namespace Antmicro.Renode.Logging
 
         public static void LogUnhandledRead(this IPeripheral peripheral, long offset)
         {
-            peripheral.Log(LogLevel.Warning, "Unhandled read from offset 0x{0:X}.", offset);
+            var registerName = "";
+            if(peripheral is IHasMappedRegisters mapped)
+            {
+                registerName = $" ({mapped.OffsetToString(offset)})";
+            }
+            peripheral.Log(LogLevel.Warning, "Unhandled read from offset 0x{0:X}{1}.", offset, registerName);
         }
 
         public static void LogUnhandledWrite(this IPeripheral peripheral, long offset, ulong value)
         {
-            peripheral.Log(LogLevel.Warning, "Unhandled write to offset 0x{0:X}, value 0x{1:X}.", offset, value);
+            var registerName = "";
+            if(peripheral is IHasMappedRegisters mapped)
+            {
+                registerName = $" ({mapped.OffsetToString(offset)})";
+            }
+            peripheral.Log(LogLevel.Warning, "Unhandled write to offset 0x{0:X}{1}, value 0x{2:X}.", offset, registerName, value);
         }
 
         public static bool PrintFullName { get; set; }
@@ -596,50 +628,68 @@ namespace Antmicro.Renode.Logging
 
             public object ExtractPreservedState()
             {
-                var peripheralsWithDifferentLoggingLevel = new PeripheralLogLevelState();
+                var loggerState = new LoggerState();
 
-                foreach(var backend in Logger.GetBackends())
+                foreach(var backend in Logger.GetBackends().Values)
                 {
-                    var customLogLevels = backend.Value.GetCustomLogLevels();
+                    var backendState = new BackendState(backend.GetLogLevel());
+                    var customLogLevels = backend.GetCustomLogLevels();
                     if(customLogLevels.Count > 0)
                     {
-                        peripheralsWithDifferentLoggingLevel[backend.Value] = new Dictionary<string, Dictionary<string, LogLevel>>();
                         foreach(var custom in customLogLevels)
                         {
-                            TryGetName(custom.Key, out string peripheralName, out string machineName);
-                            if(!peripheralsWithDifferentLoggingLevel[backend.Value].TryGetValue(machineName, out var machineDict))
+                            if(!TryGetName(custom.Key, out string peripheralName, out string machineName))
                             {
-                                machineDict = new Dictionary<string, LogLevel>();
-                                peripheralsWithDifferentLoggingLevel[backend.Value][machineName] = machineDict;
+                                Log(LogLevel.Warning, "Could not extract logging level for key: {0} in backend: {1}", custom.Key, backend);
+                                continue;
                             }
-                            machineDict[peripheralName] = custom.Value;
+                            backendState.Add(machineName, peripheralName, custom.Value);
                         }
                     }
+
+                    if(backendState.LogLevel != DefaultLogLevel || backendState.PeripheralsCustomLogLevel.Count > 0)
+                    {
+                        loggerState.Add(backend, backendState);
+                    }
                 }
-                return peripheralsWithDifferentLoggingLevel;
+
+                return loggerState;
             }
 
             public void LoadPreservedState(object state)
             {
-                if(!(state is PeripheralLogLevelState peripheralsWithDifferentLoggingLevel))
+                if(!(state is LoggerState loggerState))
                 {
                     throw new RecoverableException("Unexpected state received while loading preserved state");
                 }
 
-                foreach(var backendToMachine in peripheralsWithDifferentLoggingLevel)
+                foreach(var backendToState in loggerState)
                 {
-                    foreach(var machineToPeripheral in backendToMachine.Value)
+                    var backend = backendToState.Key;
+                    var backendState = backendToState.Value;
+
+                    backend.Reset();
+                    backend.SetLogLevel(backendState.LogLevel);
+
+                    foreach(var machineToPeripherals in backendState.PeripheralsCustomLogLevel)
                     {
-                        if(!EmulationManager.Instance.CurrentEmulation.TryGetMachineByName(machineToPeripheral.Key, out var machine))
+                        var machineName = machineToPeripherals.Key;
+                        var peripheralStates = machineToPeripherals.Value;
+
+                        if(!EmulationManager.Instance.CurrentEmulation.TryGetMachineByName(machineName, out var machine))
                         {
-                            throw new RecoverableException($"Could not restore peripherals' logging level for Machine: {machineToPeripheral.Key}");
+                            throw new RecoverableException($"Could not restore peripherals' logging level for Machine: {machineName}");
                         }
-                        foreach(var peripheral in machineToPeripheral.Value)
+
+                        foreach(var peripheralState in peripheralStates)
                         {
+                            var peripheralName = peripheralState.Key;
+                            var peripheralLogLevel = peripheralState.Value;
+
                             IEmulationElement emulationElement = null;
-                            EmulationManager.Instance.CurrentEmulation.TryGetEmulationElementByName(peripheral.Key, machine, out emulationElement);
+                            EmulationManager.Instance.CurrentEmulation.TryGetEmulationElementByName(peripheralName, machine, out emulationElement);
                             int id = EmulationManager.Instance.CurrentEmulation.CurrentLogger.GetOrCreateSourceId(emulationElement);
-                            backendToMachine.Key.SetLogLevel(peripheral.Value, id);
+                            backend.SetLogLevel(peripheralLogLevel, id);
                         }
                     }
                 }

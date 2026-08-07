@@ -69,9 +69,14 @@ namespace Antmicro.Renode.Peripherals.CPU
             }
         }
 
-        public override IEnumerable<CPURegister> GetRegisters()
+        public override IEnumerable<CPURegister> GetAllRegisters()
         {
             return mapping.Values.Concat(GetNonMappedRegisters()).OrderBy(x => x.Index);
+        }
+
+        public override IEnumerable<CPURegister> GetRegisters()
+        {
+            return mapping.Values.OrderBy(x => x.Index);
         }
 
         [Register]
@@ -213,6 +218,20 @@ namespace Antmicro.Renode.Peripherals.CPU
             {
                 value = BeforeSTVECWrite(value);
                 SetRegisterValue64((int)RiscV64Registers.STVEC, value);
+            }
+        }
+
+        [Register]
+        public RegisterValue JVT
+        {
+            get
+            {
+                return GetRegisterValue64((int)RiscV64Registers.JVT);
+            }
+
+            set
+            {
+                SetRegisterValue64((int)RiscV64Registers.JVT, value);
             }
         }
 
@@ -878,6 +897,7 @@ namespace Antmicro.Renode.Peripherals.CPU
             { RiscV64Registers.SSTATUS,  new CPURegister(321, 64, isGeneral: false, isReadonly: false, aliases: new [] { "SSTATUS" }) },
             { RiscV64Registers.SIE,  new CPURegister(325, 64, isGeneral: false, isReadonly: false, aliases: new [] { "SIE" }) },
             { RiscV64Registers.STVEC,  new CPURegister(326, 64, isGeneral: false, isReadonly: false, aliases: new [] { "STVEC" }) },
+            { RiscV64Registers.JVT,  new CPURegister(344, 64, isGeneral: false, isReadonly: false, aliases: new [] { "JVT" }) },
             { RiscV64Registers.SSCRATCH,  new CPURegister(385, 64, isGeneral: false, isReadonly: false, aliases: new [] { "SSCRATCH" }) },
             { RiscV64Registers.SEPC,  new CPURegister(386, 64, isGeneral: false, isReadonly: false, aliases: new [] { "SEPC" }) },
             { RiscV64Registers.SCAUSE,  new CPURegister(387, 64, isGeneral: false, isReadonly: false, aliases: new [] { "SCAUSE" }) },
@@ -915,6 +935,7 @@ namespace Antmicro.Renode.Peripherals.CPU
         SSTATUS = 321,
         SIE = 325,
         STVEC = 326,
+        JVT = 344,
         SSCRATCH = 385,
         SEPC = 386,
         SCAUSE = 387,

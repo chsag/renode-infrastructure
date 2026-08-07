@@ -1,11 +1,12 @@
 //
-// Copyright (c) 2010-2025 Antmicro
+// Copyright (c) 2010-2026 Antmicro
 //
 // This file is licensed under the MIT License.
 // Full license text is available in 'licenses/MIT.txt'.
 //
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Linq;
 using System.Runtime.InteropServices;
 
@@ -27,7 +28,7 @@ using Endianess = ELFSharp.ELF.Endianess;
 
 namespace Antmicro.Renode.Peripherals.CPU
 {
-    public abstract class BaseRiscV : TranslationCPU, IPeripheralContainer<ICFU, NumberRegistrationPoint<int>>, IPeripheralContainer<IIndirectCSRPeripheral, BusRangeRegistration>, IPeripheralRegister<ExternalPMPBase, NullRegistrationPoint>, ICPUWithPostOpcodeExecutionHooks, ICPUWithPreOpcodeExecutionHooks, ICPUWithPostGprAccessHooks, ICPUWithNMI
+    public abstract class BaseRiscV : TranslationCPU, IPeripheralContainer<ICFU, NumberRegistrationPoint<int>>, IPeripheralContainer<IIndirectCSRPeripheral, BusRangeRegistration>, IRegisterablePeripheral<ExternalPMPBase, NullRegistrationPoint>, ICPUWithPostGprAccessHooks, ICPUWithNMI, ICPUWithDirtyAdressesSharing
     {
         public void Register(ICFU cfu, NumberRegistrationPoint<int> registrationPoint)
         {
@@ -84,16 +85,6 @@ namespace Antmicro.Renode.Peripherals.CPU
         public void EnablePostGprAccessHooks(uint value)
         {
             TlibEnablePostGprAccessHooks(value != 0 ? 1u : 0u);
-        }
-
-        public void EnablePostOpcodeExecutionHooks(uint value)
-        {
-            TlibEnablePostOpcodeExecutionHooks(value != 0 ? 1u : 0u);
-        }
-
-        public void EnablePreOpcodeExecutionHooks(uint value)
-        {
-            TlibEnablePreOpcodeExecutionHooks(value != 0 ? 1u : 0u);
         }
 
         public ulong Vector(uint registerNumber, uint elementIndex, ulong? value = null)
@@ -160,38 +151,6 @@ namespace Antmicro.Renode.Peripherals.CPU
             {
                 throw new ConstructionException($"Failed to install custom internal interrupt because it clashes with a standard interrupt. Id {id}");
             }
-        }
-
-        public void AddPostOpcodeExecutionHook(UInt64 mask, UInt64 value, Action<ulong, ulong> action)
-        {
-            var index = TlibInstallPostOpcodeExecutionHook(mask, value);
-            if(index == UInt32.MaxValue)
-            {
-                throw new RecoverableException("Unable to register opcode hook. Maximum number of hooks already installed");
-            }
-            // Assert that the list index will match the one returned from the core
-            if(index != postOpcodeExecutionHooks.Count)
-            {
-                throw new ApplicationException("Mismatch in the post-execution opcode hooks on the C# and C side." +
-                                                " One of them miss at least one element");
-            }
-            postOpcodeExecutionHooks.Add(action);
-        }
-
-        public void AddPreOpcodeExecutionHook(UInt64 mask, UInt64 value, Action<ulong, ulong> action)
-        {
-            var index = TlibInstallPreOpcodeExecutionHook(mask, value);
-            if(index == UInt32.MaxValue)
-            {
-                throw new RecoverableException("Unable to register opcode hook. Maximum number of hooks already installed");
-            }
-            // Assert that the list index will match the one returned from the core
-            if(index != preOpcodeExecutionHooks.Count)
-            {
-                throw new ApplicationException("Mismatch in the pre-execution opcode hooks on the C# and C side." +
-                                                " One of them miss at least one element");
-            }
-            preOpcodeExecutionHooks.Add(action);
         }
 
         public void RegisterCustomCSR(string name, ushort number, PrivilegeLevel mode)
@@ -306,6 +265,11 @@ namespace Antmicro.Renode.Peripherals.CPU
             return TlibIsFeatureEnabled((uint)set) == 1;
         }
 
+        public bool SupportsExtensionSet(StandardInstructionSetExtensions set)
+        {
+            return TlibIsAdditionalFeatureEnabled((uint)set) == 1;
+        }
+
         public override void Reset()
         {
             base.Reset();
@@ -320,6 +284,7 @@ namespace Antmicro.Renode.Peripherals.CPU
             SetPCFromResetVector();
             TlibSetPmpaddrBits(PMPNumberOfAddrBits);
             TlibSetNapotGrain(MinimalPMPNapotInBytes);
+            TlibSetPmpEntryCount(PMPEntryCount);
         }
 
         public void Register(ExternalPMPBase externalPMP, NullRegistrationPoint registrationPoint)
@@ -462,7 +427,8 @@ namespace Antmicro.Renode.Peripherals.CPU
                 var registerWidth = (uint)MostSignificantBit + 1;
                 RiscVRegisterDescription.AddCpuFeature(ref gdbFeatures, registerWidth);
                 RiscVRegisterDescription.AddFpuFeature(ref gdbFeatures, registerWidth, false, SupportsInstructionSet(InstructionSet.F), SupportsInstructionSet(InstructionSet.D), false);
-                RiscVRegisterDescription.AddCSRFeature(ref gdbFeatures, registerWidth, SupportsInstructionSet(InstructionSet.S), SupportsInstructionSet(InstructionSet.U), false, SupportsInstructionSet(InstructionSet.V));
+                RiscVRegisterDescription.AddCSRFeature(ref gdbFeatures, registerWidth, SupportsInstructionSet(InstructionSet.S), SupportsInstructionSet(InstructionSet.U), false, SupportsInstructionSet(InstructionSet.V), SupportsExtensionSet(StandardInstructionSetExtensions.ZCMT));
+
                 RiscVRegisterDescription.AddVirtualFeature(ref gdbFeatures, registerWidth);
                 RiscVRegisterDescription.AddCustomCSRFeature(ref gdbFeatures, registerWidth, nonstandardCSR);
                 if(SupportsInstructionSet(InstructionSet.V))
@@ -487,7 +453,13 @@ namespace Antmicro.Renode.Peripherals.CPU
 
         public uint PMPNumberOfAddrBits { get; private set; }
 
+        public uint PMPEntryCount { get; }
+
         public IEnumerable<InstructionSet> ArchitectureSets => architectureDecoder.InstructionSets;
+
+        public override Endianess DisassemblyHexFormatting => Endianess.LittleEndian;
+
+        public override string LLVMModel => RiscVLLVMModelEncoder.GetModel(this);
 
         public abstract RegisterValue VLEN { get; }
 
@@ -521,10 +493,15 @@ namespace Antmicro.Renode.Peripherals.CPU
             uint minimalPmpNapotInBytes = 8,
             uint pmpNumberOfAddrBits = 32,
             PrivilegeLevels privilegeLevels = PrivilegeLevels.MachineSupervisorUser,
-            bool useMachineAtomicState = true
+            bool useMachineAtomicState = true,
+            uint pmpEntryCount = 64
         )
             : base(hartId, cpuType, machine, endianness, bitness, useMachineAtomicState)
         {
+            if(pmpEntryCount != 0 && pmpEntryCount != 16 && pmpEntryCount != 64)
+            {
+                throw new ConstructionException($"Invalid PMP entry count ({pmpEntryCount}), only 0, 16, and 64 are allowed");
+            }
             HartId = hartId;
             this.timeProvider = timeProvider;
             this.privilegedArchitecture = privilegedArchitecture;
@@ -540,8 +517,6 @@ namespace Antmicro.Renode.Peripherals.CPU
             ChildCollection = new Dictionary<int, ICFU>();
 
             customOpcodes = new List<Tuple<string, ulong, ulong>>();
-            postOpcodeExecutionHooks = new List<Action<ulong, ulong>>();
-            preOpcodeExecutionHooks = new List<Action<ulong, ulong>>();
             postGprAccessHooks = new Action<bool>[NumberOfGeneralPurposeRegisters];
 
             architectureDecoder = new ArchitectureDecoder(machine, this, cpuType, privilegeLevels);
@@ -566,6 +541,8 @@ namespace Antmicro.Renode.Peripherals.CPU
             TlibSetPmpaddrBits(pmpNumberOfAddrBits);
             MinimalPMPNapotInBytes = minimalPmpNapotInBytes;
             TlibSetNapotGrain(minimalPmpNapotInBytes);
+            PMPEntryCount = pmpEntryCount;
+            TlibSetPmpEntryCount(PMPEntryCount);
 
             RegisterCSR((ushort)StandardCSR.Miselect, () => miselectValue, s => miselectValue = (uint)s, "miselect");
             for(ushort i = 0; i < 6; ++i)
@@ -1031,34 +1008,6 @@ namespace Antmicro.Renode.Peripherals.CPU
         }
 
         [Export]
-        private void HandlePostOpcodeExecutionHook(UInt32 id, UInt64 pc, UInt64 opcode)
-        {
-            this.NoisyLog($"Got post-opcode hook for opcode `0x{opcode:X}` with id {id} from PC {pc}");
-            if(id < (uint)postOpcodeExecutionHooks.Count)
-            {
-                postOpcodeExecutionHooks[(int)id].Invoke(pc, opcode);
-            }
-            else
-            {
-                this.ErrorLog("Received post-opcode hook for opcode `0x{0:X}` with non-existing id = {1}", opcode, id);
-            }
-        }
-
-        [Export]
-        private void HandlePreOpcodeExecutionHook(UInt32 id, UInt64 pc, UInt64 opcode)
-        {
-            this.NoisyLog($"Got pre-opcode hook for opcode `0x{opcode:X}` with id {id} from PC {pc}");
-            if(id < (uint)preOpcodeExecutionHooks.Count)
-            {
-                preOpcodeExecutionHooks[(int)id].Invoke(pc, opcode);
-            }
-            else
-            {
-                this.ErrorLog("Received pre-opcode hook for opcode `0x{0:X}` with non-existing id = {1}", opcode, id);
-            }
-        }
-
-        [Export]
         private void HandlePostGprAccessHook(UInt32 registerIndex, UInt32 writeOrRead)
         {
             DebugHelper.Assert(registerIndex < 32, $"Index outside of range : {registerIndex}");
@@ -1225,12 +1174,6 @@ namespace Antmicro.Renode.Peripherals.CPU
 
         private readonly Dictionary<BusRangeRegistration, IIndirectCSRPeripheral> indirectCsrPeripherals;
 
-        [Constructor]
-        private readonly List<Action<ulong, ulong>> postOpcodeExecutionHooks;
-
-        [Constructor]
-        private readonly List<Action<ulong, ulong>> preOpcodeExecutionHooks;
-
         [Transient]
         private readonly Action<bool>[] postGprAccessHooks;
 
@@ -1248,6 +1191,9 @@ namespace Antmicro.Renode.Peripherals.CPU
         [Import]
         private readonly Func<uint, uint> TlibIsFeatureAllowed;
 
+        [Import]
+        private readonly Func<uint, uint> TlibIsAdditionalFeatureEnabled;
+
         [Import(Name="tlib_set_privilege_architecture")]
         private readonly Action<int> TlibSetPrivilegeArchitecture;
 
@@ -1262,6 +1208,9 @@ namespace Antmicro.Renode.Peripherals.CPU
 
         [Import]
         private readonly Action<uint> TlibSetNapotGrain;
+
+        [Import]
+        private readonly Action<uint> TlibSetPmpEntryCount;
 
         [Import]
         private readonly Action<uint> TlibSetPmpaddrBits;
@@ -1322,18 +1271,6 @@ namespace Antmicro.Renode.Peripherals.CPU
 
         [Import]
         private readonly Func<uint, IntPtr, uint> TlibSetWholeVector;
-
-        [Import]
-        private readonly Action<uint> TlibEnablePostOpcodeExecutionHooks;
-
-        [Import]
-        private readonly Func<ulong, ulong, uint> TlibInstallPostOpcodeExecutionHook;
-
-        [Import]
-        private readonly Action<uint> TlibEnablePreOpcodeExecutionHooks;
-
-        [Import]
-        private readonly Func<ulong, ulong, uint> TlibInstallPreOpcodeExecutionHook;
 
         [Import]
         private readonly Action<uint> TlibEnablePostGprAccessHooks;
@@ -1435,6 +1372,10 @@ namespace Antmicro.Renode.Peripherals.CPU
             ZVE64D = 13,
             ZACAS = 14,
             SSCOFPMF = 15,
+            BKB = 16,
+            ZCB = 17,
+            ZCMP = 18,
+            ZCMT = 19,
         }
 
         public enum InterruptMode
@@ -1635,6 +1576,7 @@ namespace Antmicro.Renode.Peripherals.CPU
                 case "ZBB": standardExtensions.Add(StandardInstructionSetExtensions.BB); break;
                 case "ZBC": standardExtensions.Add(StandardInstructionSetExtensions.BC); break;
                 case "ZBS": standardExtensions.Add(StandardInstructionSetExtensions.BS); break;
+                case "ZBKB": standardExtensions.Add(StandardInstructionSetExtensions.BKB); break;
                 case "ZICSR": standardExtensions.Add(StandardInstructionSetExtensions.ICSR); break;
                 case "ZIFENCEI": standardExtensions.Add(StandardInstructionSetExtensions.IFENCEI); break;
                 case "ZFH": standardExtensions.Add(StandardInstructionSetExtensions.ZFH); break;
@@ -1645,6 +1587,32 @@ namespace Antmicro.Renode.Peripherals.CPU
                 case "ZVE64F": standardExtensions.Add(StandardInstructionSetExtensions.ZVE64F); break;
                 case "ZVE64D": standardExtensions.Add(StandardInstructionSetExtensions.ZVE64D); break;
                 case "ZACAS": standardExtensions.Add(StandardInstructionSetExtensions.ZACAS); break;
+                case "ZCA":
+                    instructionSets.Add(InstructionSet.C); // ZCA maps to base C extension
+                    break;
+                case "ZCB": standardExtensions.Add(StandardInstructionSetExtensions.ZCB); break;
+                case "ZCMP":
+                    if(!instructionSets.Contains(InstructionSet.C))
+                    {
+                        throw new ConstructionException("Zcmp extension requires C instruction set");
+                    }
+                    if(instructionSets.Contains(InstructionSet.D))
+                    {
+                        throw new ConstructionException($"ISA string cannot contain both Zcmp extension and D instruction set at the same time.");
+                    }
+                    standardExtensions.Add(StandardInstructionSetExtensions.ZCMP);
+                    break;
+                case "ZCMT":
+                    if(!instructionSets.Contains(InstructionSet.C))
+                    {
+                        throw new ConstructionException("Zcmt extension requires C instruction set");
+                    }
+                    if(instructionSets.Contains(InstructionSet.D))
+                    {
+                        throw new ConstructionException($"ISA string cannot contain both Zcmt extension and D instruction set at the same time.");
+                    }
+                    standardExtensions.Add(StandardInstructionSetExtensions.ZCMT);
+                    break;
                 default:
                     throw new ConstructionException($"Undefined instructions set extension: '{name}'");
                 }
@@ -1664,7 +1632,7 @@ namespace Antmicro.Renode.Peripherals.CPU
                     instructionSets.Add(InstructionSet.U);
                     break;
                 default:
-                    throw new Exception("Unreachable");
+                    throw new UnreachableException();
                 }
             }
 

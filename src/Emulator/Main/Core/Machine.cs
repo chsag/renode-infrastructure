@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2010-2025 Antmicro
+// Copyright (c) 2010-2026 Antmicro
 // Copyright (c) 2011-2015 Realtime Embedded
 //
 // This file is licensed under the MIT License.
@@ -8,6 +8,7 @@
 using System;
 using System.Collections.Generic;
 using System.Collections.ObjectModel;
+using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Net.Sockets;
@@ -15,6 +16,7 @@ using System.Reflection;
 using System.Text;
 
 using Antmicro.Migrant;
+using Antmicro.Migrant.Hooks;
 using Antmicro.Renode.Core.Structure;
 using Antmicro.Renode.EventRecording;
 using Antmicro.Renode.Exceptions;
@@ -59,10 +61,11 @@ namespace Antmicro.Renode.Core
             SetLocalName(SystemBus, SystemBusName);
             gdbStubs = new Dictionary<int, GdbStub>();
 
-            invalidatedAddressesByCpu = new Dictionary<ICPU, List<long>>();
+            invalidatedAddressesByCpu = new Dictionary<TranslationCPU, List<long>>();
             invalidatedAddressesByArchitecture = new Dictionary<string, List<long>>();
+            firstUnbroadcastedDirtyAddressIndex = new Dictionary<TranslationCPU, int>();
             invalidatedAddressesLock = new object();
-            firstUnbroadcastedDirtyAddressIndex = new Dictionary<ICPU, int>();
+            beforeHaltState = new Dictionary<IHaltable, bool>();
 
             if(createLocalTimeSource)
             {
@@ -70,6 +73,7 @@ namespace Antmicro.Renode.Core
             }
 
             machineCreatedAt = new DateTime(CustomDateTime.Now.Ticks, DateTimeKind.Local);
+            UniqueObjectId = IdentifiableObject.AssignUniqueObjectId();
         }
 
         public void Dispose()
@@ -98,6 +102,9 @@ namespace Antmicro.Renode.Core
             }
             gdbStubs.Clear();
 
+            DetachIncomingInterrupts(registeredPeripherals.ToArray());
+            DetachOutgoingInterrupts(registeredPeripherals);
+
             // ordering below is due to the fact that the CPU can use other peripherals, e.g. Memory so it should be disposed first
             // Mapped memory can be used as storage by other disposable peripherals which may want to read it while being disposed
             foreach(var peripheral in GetPeripheralsOfType<IDisposable>().OrderBy(x => x is ICPU ? 0 : x is IMapped ? 2 : 1))
@@ -122,6 +129,10 @@ namespace Antmicro.Renode.Core
 
         public IManagedThread ObtainManagedThread(Action action, uint frequency, string name = "managed thread", IEmulationElement owner = null, Func<bool> stopCondition = null)
         {
+            if(frequency == 0)
+            {
+                throw new RecoverableException("Frequency must be higher than zero");
+            }
             return new ManagedThreadWrappingClockEntry(this, action, frequency, name, owner, stopCondition);
         }
 
@@ -157,8 +168,8 @@ namespace Antmicro.Renode.Core
                 x => x.Period.ToString(),
                 x => x.Value.ToString(),
                 x => x.Step.ToString(),
-                x => x.Period == 0 ? "---" : Misc.NormalizeDecimal((ulong)(x.Frequency * x.Step) / (double)x.Period) + "Hz",
-                x => (x.Frequency == 0 || x.Period == 0) ? "---" : Misc.NormalizeDecimal((ulong)x.Period / (x.Frequency * (double)x.Step)) + "s"
+                x => x.Period == 0 ? "---" : Misc.NormalizeDecimal((x.Frequency * x.Step) / (double)x.Period) + "Hz",
+                x => (x.Frequency == 0 || x.Period == 0) ? "---" : Misc.NormalizeDecimal(x.Period / (x.Frequency * (double)x.Step)) + "s"
             );
             return table.ToArray();
         }
@@ -217,7 +228,7 @@ namespace Antmicro.Renode.Core
             }
 
             default:
-                throw new Exception("Should not reach here");
+                throw new UnreachableException();
             }
         }
 
@@ -243,7 +254,7 @@ namespace Antmicro.Renode.Core
             }
 
             default:
-                throw new Exception("Should not reach here");
+                throw new UnreachableException();
             }
         }
 
@@ -266,11 +277,11 @@ namespace Antmicro.Renode.Core
             }
 
             default:
-                throw new Exception("Should not reach here");
+                throw new UnreachableException();
             }
         }
 
-        public long[] GetNewDirtyAddressesForCore(ICPU cpu)
+        public long[] GetNewDirtyAddressesForCore(TranslationCPU cpu)
         {
             if(!firstUnbroadcastedDirtyAddressIndex.ContainsKey(cpu))
             {
@@ -288,7 +299,7 @@ namespace Antmicro.Renode.Core
             return newAddresses;
         }
 
-        public void AppendDirtyAddresses(ICPU cpu, long[] addresses)
+        public void AppendDirtyAddresses(TranslationCPU cpu, long[] addresses)
         {
             if(!invalidatedAddressesByCpu.ContainsKey(cpu))
             {
@@ -324,7 +335,7 @@ namespace Antmicro.Renode.Core
             }
 
             default:
-                throw new Exception("Should not reach here");
+                throw new UnreachableException();
             }
         }
 
@@ -339,6 +350,7 @@ namespace Antmicro.Renode.Core
                     foreach(var peripheral in registeredPeripherals.Distinct().Where(p => p != this && !(unresetable?.Contains(p) ?? false)))
                     {
                         peripheral.Reset();
+                        PeripheralReset?.Invoke(this, peripheral);
                     }
                 }
                 postReset?.Invoke();
@@ -660,7 +672,10 @@ namespace Antmicro.Renode.Core
 
         public void HandleTimeProgress(TimeInterval diff)
         {
-            clockSource.Advance(diff);
+            if(!IsHalted)
+            {
+                clockSource.Advance(diff);
+            }
         }
 
         public void RequestReset()
@@ -792,6 +807,8 @@ namespace Antmicro.Renode.Core
             {
                 using(ObtainPausedState(true))
                 {
+                    // A machine being halted through reset breaks platforms relying on halting cores in init scripts
+                    IsHalted = false;
                     foreach(var resetable in registeredPeripherals.Distinct().ToList())
                     {
                         if(resetable == this)
@@ -992,21 +1009,24 @@ namespace Antmicro.Renode.Core
             return node == null ? new IPeripheral[0] : node.Parents.Select(x => x.Value).Distinct();
         }
 
+        [LatePostDeserializationAttribute]
+        public void PostDeserializationHook()
+        {
+            wasDeserialized = true;
+        }
+
         public void PostCreationActions()
         {
             // Enable broadcasting dirty addresses if there are multiple CPUs of an architecture supporting the mechanism.
-            foreach(var architecture in architecturesWithBroadcastSupport)
-            {
-                var translationCPUs = SystemBus.GetCPUs()
-                    .Where(cpu => cpu.Architecture == architecture)
-                    .OfType<TranslationCPU>().ToArray();
+            var translationCPUs = SystemBus.GetCPUs()
+                .OfType<TranslationCPU>()
+                .Where(cpu => cpu is ICPUWithDirtyAdressesSharing);
 
-                if(translationCPUs.Count() > 1)
+            if(translationCPUs.Count() > 1)
+            {
+                foreach(var cpu in translationCPUs)
                 {
-                    foreach(var cpu in translationCPUs)
-                    {
-                        cpu.SetBroadcastDirty(true);
-                    }
+                    cpu.SetBroadcastDirty(true);
                 }
             }
 
@@ -1026,7 +1046,7 @@ namespace Antmicro.Renode.Core
             // Register io_executable flags for all ArrayMemory peripherals
             foreach(var context in SystemBus.GetAllContextKeys())
             {
-                foreach(var registration in SystemBus.GetRegistrationsForPeripheralType<Peripherals.Memory.ArrayMemory>(context))
+                foreach(var registration in SystemBus.GetRegistrationsForPeripheralType<IExecutableIO>(context))
                 {
                     var range = registration.RegistrationPoint.Range;
                     var perCore = registration.RegistrationPoint.Initiator;
@@ -1343,6 +1363,55 @@ namespace Antmicro.Renode.Core
 
         public bool IgnorePeripheralRegistrationConditions { get; set; }
 
+        public int UniqueObjectId { get; }
+
+        public bool IsHalted
+        {
+            get => isHalted;
+            set
+            {
+                if(value == isHalted)
+                {
+                    return;
+                }
+                lock(pausingSync)
+                {
+                    using(ObtainPausedState(true))
+                    {
+                        if(value)
+                        {
+                            // Moving to halted state.
+                            foreach(var haltable in GetPeripheralsOfType<IHaltable>())
+                            {
+                                // Save state before machine halt to restore on machine resume
+                                beforeHaltState.Add(haltable, haltable.IsHalted);
+                                haltable.IsHalted = true;
+                            }
+                        }
+                        else
+                        {
+                            // Resuming
+                            foreach(var haltable in GetPeripheralsOfType<IHaltable>())
+                            {
+                                if(beforeHaltState.TryGetValue(haltable, out var state))
+                                {
+                                    haltable.IsHalted = state;
+                                }
+                                else
+                                {
+                                    // In case a peripheral was added in the halted state, just leave it in its current state
+                                    var hasLocalName = TryGetLocalName(haltable as IPeripheral, out var localName);
+                                    this.WarningLog("Peripheral {0} without a stored IsHalted state encountered on unhalting machine", hasLocalName ? localName : "");
+                                }
+                            }
+                            beforeHaltState.Clear();
+                        }
+                        isHalted = value;
+                    }
+                }
+            }
+        }
+
         [field: Transient]
         public event Action<IMachine> MachineReset;
 
@@ -1370,6 +1439,14 @@ namespace Antmicro.Renode.Core
             {
                 foreach(var gpio in peripheral.GetGPIOs().Select(x => x.Item2))
                 {
+                    var endpoints = gpio.Endpoints;
+                    for(var i = 0; i < endpoints.Count; ++i)
+                    {
+                        if(endpoints[i].Receiver is IConnectable<IPeripheral> connectable)
+                        {
+                            connectable.DetachFrom(peripheral);
+                        }
+                    }
                     gpio.Disconnect();
                 }
             }
@@ -1432,6 +1509,15 @@ namespace Antmicro.Renode.Core
                     Resume();
                     return;
                 }
+
+                // If this object was recreated during deserialization
+                // we have to finish its initialization
+                if(wasDeserialized)
+                {
+                    PostCreationActions();
+                    wasDeserialized = false;
+                }
+
                 foreach(var ownLife in ownLifes.OrderBy(x => x is ICPU ? 1 : 0))
                 {
                     if(startFilter(ownLife))
@@ -1483,7 +1569,11 @@ namespace Antmicro.Renode.Core
                         var endpoints = gpio.Endpoints;
                         for(var i = 0; i < endpoints.Count; ++i)
                         {
-                            if(endpoints[i].Receiver == detachedPeripheral)
+                            if(endpoints[i].Receiver is IConnectable<IPeripheral> connectable)
+                            {
+                                connectable.DetachFrom(peripheral);
+                            }
+                            else if(endpoints[i].Receiver == detachedPeripheral)
                             {
                                 gpio.Disconnect(endpoints[i]);
                             }
@@ -1670,26 +1760,43 @@ namespace Antmicro.Renode.Core
             }
         }
 
-        private void TryReduceBroadcastedDirtyAddresses(ICPU cpu)
+        private void TryReduceBroadcastedDirtyAddresses(TranslationCPU cpu)
         {
-            var sameArchitectureCPUs = firstUnbroadcastedDirtyAddressIndex
-                .Where(pair => pair.Key.Architecture == cpu.Architecture)
-                .ToArray();
+            var firstUnbroadcastedAddressesOfSameArchCPUs = firstUnbroadcastedDirtyAddressIndex
+                .Where(pair => pair.Key.Architecture == cpu.Architecture);
 
-            var firstUnread = sameArchitectureCPUs.Select(pair => pair.Value).Min();
+            // Halted CPUs are not considered here because their whole translation cache is cleared on unhalting
+            foreach(var haltedSameArchCPU in firstUnbroadcastedAddressesOfSameArchCPUs.Select(pair => pair.Key).Where(c => c.IsHalted))
+            {
+                firstUnbroadcastedDirtyAddressIndex[haltedSameArchCPU] = invalidatedAddressesByCpu[haltedSameArchCPU].Count;
+            }
+
+            var firstUnread = firstUnbroadcastedAddressesOfSameArchCPUs.Select(pair => pair.Value).Min();
             if(firstUnread == 0)
             {
-                var laggingCPUNames = sameArchitectureCPUs.Where(pair => pair.Value == 0).Select(pair => pair.Key.GetName());
+                var laggingCPUs = firstUnbroadcastedAddressesOfSameArchCPUs.Where(pair => pair.Value == 0).Select(pair => pair.Key);
                 cpu.DebugLog(
-                    "Attempted reduction of {0} dirty addresses list failed, current count: {1}, CPUs that didn't fetch any: {2}",
-                    cpu.Architecture, invalidatedAddressesByCpu[cpu].Count, string.Join(", ", laggingCPUNames));
-                return;
+                    "Attempted reduction of {0} dirty addresses list failed, current count: {1}, " +
+                    "requesting TB cache clear on CPUs that didn't fetch any: {2}",
+                    cpu.Architecture, invalidatedAddressesByCpu[cpu].Count, string.Join(", ", laggingCPUs.Select(c => c.GetName()))
+                );
+
+                foreach(var laggingCPU in laggingCPUs)
+                {
+                    laggingCPU.RequestTranslationCacheClearing();
+
+                    // TB cache will be cleared so there's no need to broadcast any of the addresses from the current list anymore.
+                    firstUnbroadcastedDirtyAddressIndex[laggingCPU] = invalidatedAddressesByCpu[laggingCPU].Count;
+                }
+
+                // Let's re-establish `firstUnread`.
+                firstUnread = firstUnbroadcastedAddressesOfSameArchCPUs.Select(pair => pair.Value).Min();
             }
 
             invalidatedAddressesByCpu[cpu].RemoveRange(0, (int)firstUnread);
-            foreach(var key in sameArchitectureCPUs.Select(pair => pair.Key))
+            foreach(var sameArchCPU in firstUnbroadcastedAddressesOfSameArchCPUs.Select(pair => pair.Key))
             {
-                firstUnbroadcastedDirtyAddressIndex[key] -= firstUnread;
+                firstUnbroadcastedDirtyAddressIndex[sameArchCPU] -= firstUnread;
             }
         }
 
@@ -1710,7 +1817,7 @@ namespace Antmicro.Renode.Core
                             throw new RecoverableException($"{cpu.Model ?? "Unknown model"}: CPU architecture not provided");
                         }
 
-                        if(architecturesWithBroadcastSupport.Contains(cpu.Architecture))
+                        if(cpu is ICPUWithDirtyAdressesSharing)
                         {
                             InitializeInvalidatedAddressesList(cpu);
                             firstUnbroadcastedDirtyAddressIndex[cpu] = 0;
@@ -1799,7 +1906,7 @@ namespace Antmicro.Renode.Core
             return parents;
         }
 
-        private void InitializeInvalidatedAddressesList(ICPU cpu)
+        private void InitializeInvalidatedAddressesList(TranslationCPU cpu)
         {
             lock(invalidatedAddressesLock)
             {
@@ -1812,6 +1919,7 @@ namespace Antmicro.Renode.Core
             }
         }
 
+        private bool wasDeserialized;
         private int currentStampLevel;
         private bool alreadyDisposed;
         private Action<string> userStateHook;
@@ -1823,6 +1931,7 @@ namespace Antmicro.Renode.Core
         private TimeSourceBase localTimeSource;
         private Player player;
         private Recorder recorder;
+        private bool isHalted;
         private readonly PausedState pausedState;
 
         private readonly AtomicState atomicState;
@@ -1835,21 +1944,10 @@ namespace Antmicro.Renode.Core
         private readonly BaseClockSource clockSource;
         private readonly object invalidatedAddressesLock;
         private readonly Dictionary<string, List<long>> invalidatedAddressesByArchitecture;
-        private readonly Dictionary<ICPU, List<long>> invalidatedAddressesByCpu;
+        private readonly Dictionary<TranslationCPU, List<long>> invalidatedAddressesByCpu;
 
-        private readonly Dictionary<ICPU, int> firstUnbroadcastedDirtyAddressIndex;
-
-        /*
-         *  Variables used for memory invalidation
-         *  Currently the mechanism only applies to ARM and RISC-V CPUs.
-         */
-        private readonly string[] architecturesWithBroadcastSupport = new string[] {
-            "arm",
-            "arm-m",
-            "arm64",
-            "riscv",
-            "riscv64",
-        };
+        private readonly Dictionary<TranslationCPU, int> firstUnbroadcastedDirtyAddressIndex;
+        private readonly Dictionary<IHaltable, bool> beforeHaltState;
 
         private readonly DateTime machineCreatedAt;
         private readonly object collectionSync;
@@ -2118,6 +2216,11 @@ namespace Antmicro.Renode.Core
             public void Stop()
             {
                 machine.ClockSource.ExchangeClockEntryWith(action, x => x.With(enabled: false));
+            }
+
+            public void Restart()
+            {
+                machine.ClockSource.ExchangeClockEntryWith(action, x => x.With(enabled: true, value: x.Direction == Direction.Ascending ? 0 : x.Period));
             }
 
             public uint Frequency

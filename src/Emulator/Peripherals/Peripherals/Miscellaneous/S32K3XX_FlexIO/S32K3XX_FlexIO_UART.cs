@@ -1,11 +1,12 @@
 //
-// Copyright (c) 2010-2024 Antmicro
+// Copyright (c) 2010-2026 Antmicro
 //
 // This file is licensed under the MIT License.
 // Full license text is available in 'licenses/MIT.txt'.
 //
 using System;
 using System.Collections.Generic;
+using System.Numerics;
 
 using Antmicro.Migrant;
 using Antmicro.Renode.Exceptions;
@@ -15,7 +16,7 @@ using Antmicro.Renode.Peripherals.UART;
 
 namespace Antmicro.Renode.Peripherals.Miscellaneous
 {
-    public class S32K3XX_FlexIO_UART : IUART, IEndpoint
+    public class S32K3XX_FlexIO_UART : IUARTWithFrameInfo, IUARTWithFrameInfo<ushort>, IUARTWithFrameInfo<uint>, IEndpoint
     {
         public S32K3XX_FlexIO_UART(uint? rxShifterId = null, uint? txShifterId = null)
         {
@@ -43,6 +44,8 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             {
                 transmitter = new UARTTransmitter(this, shifter);
                 transmitter.CharReceived += val => CharReceived?.Invoke(val);
+                transmitter.WordReceived += val => WordCharReceived?.Invoke(val);
+                transmitter.DoubleWordReceived += val => DoubleWordCharReceived?.Invoke(val);
             }
 
             if(errors.Count > 0)
@@ -59,22 +62,58 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 
         public void WriteChar(byte value)
         {
-            if(receiver == null)
-            {
-                this.Log(LogLevel.Warning, "The UART doesn't support receiving, no shifter set");
-                return;
-            }
-            receiver.WriteChar(value);
+            WriteChar(value, null);
+        }
+
+        public void WriteChar(ushort value)
+        {
+            WriteChar(value, null);
+        }
+
+        public void WriteChar(uint value)
+        {
+            WriteChar(value, null);
+        }
+
+        public void WriteChar(byte value, UARTFrame frame)
+        {
+            WriteCharImpl(value, frame);
+        }
+
+        public void WriteChar(ushort value, UARTFrame frame)
+        {
+            WriteCharImpl(value, frame);
+        }
+
+        public void WriteChar(uint value, UARTFrame frame)
+        {
+            WriteCharImpl(value, frame);
         }
 
         public uint BaudRate => LogWarningWhenDirectionsDiffer(GetBaudRate(receiver), GetBaudRate(transmitter), "BaudRate") ?? 0;
 
         public Bits StopBits => LogWarningWhenDirectionsDiffer(receiver?.StopBits, transmitter?.StopBits, "StopBits") ?? Bits.None;
 
-        public Parity ParityBit => Parity.None;
+        public Parity ParityBit => Parity.Unsupported;
+
+        public bool InjectFramingError { get; set; }
 
         [field: Transient]
         public event Action<byte> CharReceived;
+
+        [event: Transient]
+        event Action<ushort> IUART<ushort>.CharReceived
+        {
+            add => WordCharReceived += value;
+            remove => WordCharReceived -= value;
+        }
+
+        [event: Transient]
+        event Action<uint> IUART<uint>.CharReceived
+        {
+            add => DoubleWordCharReceived += value;
+            remove => DoubleWordCharReceived -= value;
+        }
 
         private bool TryReserveShifter(S32K3XX_FlexIO flexIO, uint? id, out Shifter shifter, IList<string> errors, string parameterName)
         {
@@ -111,11 +150,46 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             return receiverProperty != null ? receiverProperty : transmitterProperty;
         }
 
+        private void WriteCharImpl<T>(T value, UARTFrame frame)
+            where T : IBinaryInteger<T>
+        {
+            if(receiver == null)
+            {
+                this.Log(LogLevel.Warning, "The UART doesn't support receiving, no shifter set");
+                return;
+            }
+
+            var receiveStatus = true;
+            if(frame != null || InjectFramingError)
+            {
+                frame = frame ?? UARTFrame.CreateFromSenderAndMessage((IUART<T>)this, value);
+                var baudRate = BaudRate;
+                if(frame.BaudRate != baudRate)
+                {
+                    this.WarningLog("Missmatched baud rate (transmitter: {0}, receiver: {1}), dropping character: 0x{2:X}", frame.BaudRate, baudRate, value);
+                    return;
+                }
+
+                if(InjectFramingError || frame.StopBits != StopBits)
+                {
+                    receiver.Shifter.Error.SetFlag(true);
+                    InjectFramingError = false;
+                    receiveStatus = false;
+                }
+            }
+
+            receiver.WriteChar(value, setStatus: receiveStatus);
+        }
+
         private S32K3XX_FlexIO flexIO;
         private UARTReceiver receiver;
         private UARTTransmitter transmitter;
 
         private readonly uint? rxShifterId;
         private readonly uint? txShifterId;
+
+        private event Action<ushort> WordCharReceived;
+
+        private event Action<uint> DoubleWordCharReceived;
     }
 }
