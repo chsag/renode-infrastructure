@@ -2,7 +2,7 @@ name: Sync upstream master
 
 on:
   schedule:
-    - cron: "0 6 * * 1"
+    - cron: "30 5 * * 1"
   workflow_dispatch:
 
 permissions:
