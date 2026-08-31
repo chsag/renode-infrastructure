@@ -109,6 +109,7 @@ namespace Antmicro.Renode.Time
             DeferredEnabled = true;
 
             TimeSource = timeSource;
+            timeSource.StopRequested += RequestPause;
 
             // we should not assign this handle to TimeSink as the source might not be configured properly yet
             TimeSink = timeSink;
@@ -428,7 +429,11 @@ namespace Antmicro.Renode.Time
                 // it does not allow the handle to be disposed when in use
                 Enabled = false;
 
+                // This will signal `HandlesCollection` to remove this handle
+                // from the list
                 DetachRequested = true;
+                TimeSource.StopRequested -= RequestPause;
+
                 sinkSideInProgress = false;
                 sourceSideInProgress = false;
                 reportPending = false;

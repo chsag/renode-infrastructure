@@ -370,6 +370,7 @@ namespace Antmicro.Renode.Peripherals.CPU
             base.Dispose();
             profiler?.Dispose();
             localAtomicState?.Dispose();
+            pauseGuard.TrueDispose();
         }
 
         public void SetHookAtBlockEnd(Action<ulong, uint> hook)
@@ -607,16 +608,14 @@ namespace Antmicro.Renode.Peripherals.CPU
         /// </returns>
         public bool TryTranslateAddress(ulong logicalAddress, MpuAccess accessType, out ulong physicalAddress)
         {
-            try
-            {
-                physicalAddress = TranslateAddress(logicalAddress, accessType);
-                return true;
-            }
-            catch(RecoverableException)
+            var translatedAddress = TranslateAddressInner(logicalAddress, accessType);
+            if(translatedAddress == ulong.MaxValue)
             {
                 physicalAddress = logicalAddress;
                 return false;
             }
+            physicalAddress = translatedAddress;
+            return true;
         }
 
         /// <summary>
@@ -629,8 +628,7 @@ namespace Antmicro.Renode.Peripherals.CPU
         /// </returns>
         public ulong TranslateAddress(ulong logicalAddress, MpuAccess accessType)
         {
-            var physicalAddress = TlibTranslateToPhysicalAddress(logicalAddress, (uint)accessType);
-            if(physicalAddress == ulong.MaxValue)
+            if(!TryTranslateAddress(logicalAddress, accessType, out var physicalAddress))
             {
                 throw new RecoverableException($"Failed to translate address: 0x{logicalAddress:X}");
             }
@@ -721,7 +719,10 @@ namespace Antmicro.Renode.Peripherals.CPU
                 }
 
                 pauseGuard.Enter();
-                lastTlibResult = (TlibExecutionResult)TlibExecute(checked((int)numberOfInstructionsToExecute));
+                lock(executionLock)
+                {
+                    lastTlibResult = (TlibExecutionResult)TlibExecute(checked((int)numberOfInstructionsToExecute));
+                }
                 pauseGuard.Leave();
             }
             catch(CpuAbortException)
@@ -2095,6 +2096,14 @@ namespace Antmicro.Renode.Peripherals.CPU
             this.Log(LogLevel.Info, "End of the interrupt: {0}", GetExceptionDescription(exceptionIndex));
         }
 
+        private ulong TranslateAddressInner(ulong logicalAddress, MpuAccess accessType)
+        {
+            lock(executionLock)
+            {
+                return TlibTranslateToPhysicalAddress(logicalAddress, (uint)accessType);
+            }
+        }
+
         private IntPtr AtomicMemoryStatePointer =>
             UseMachineAtomicState
                 ? machine.AtomicMemoryStatePointer
@@ -2398,6 +2407,7 @@ namespace Antmicro.Renode.Peripherals.CPU
 
         // TODO
         private readonly object lck = new object();
+        private readonly object executionLock = new object();
         private readonly MinimalRangesCollection mappedMemory = new MinimalRangesCollection();
         private readonly CpuThreadPauseGuard pauseGuard;
 
@@ -2460,6 +2470,13 @@ namespace Antmicro.Renode.Peripherals.CPU
             public void InitializeForReading(ulong address, SysbusAccessWidth width)
             {
                 InterruptTransaction = !ExecuteWatchpoints(address, width, null);
+            }
+
+            // We use `IDisposable.Dispose` to unlock the guard (this class is meant to be used in a `using`),
+            // but we also need to expose a method to dispose resources
+            public void TrueDispose()
+            {
+                guard.Dispose();
             }
 
             public bool InterruptTransaction { get; private set; }
