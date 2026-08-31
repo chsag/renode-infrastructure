@@ -18,6 +18,7 @@ namespace Antmicro.Renode.Peripherals.Bus.Wrappers
     {
         public RegisterMapper(Type type, string tag = null)
         {
+            tagString = tag is null ? "" : $" in \"{tag}\"";
             if(type.IsEnum)
             {
                 RegisterEnumMapping(type);
@@ -26,14 +27,12 @@ namespace Antmicro.Renode.Peripherals.Bus.Wrappers
 
             var peripheralType = type;
             var types = peripheralType.GetAllNestedTypes();
-            var interestingEnums = new List<Type>();
+            var interestingEnums = types.Where(t => t.GetCustomAttributes(false).Any(x => x is RegistersDescriptionAttribute attr && attr.Contains(tag))).ToList();
 
-            var enumsWithAttribute = types.Where(t => t.GetCustomAttributes(false).Any(x => x is RegistersDescriptionAttribute attr && attr.Tag == tag));
-            if(enumsWithAttribute != null)
+            if(interestingEnums.Count == 0)
             {
-                interestingEnums.AddRange(enumsWithAttribute);
+                interestingEnums = types.Where(t => t.BaseType == typeof(Enum) && t.Name.Contains("register", StringComparison.CurrentCultureIgnoreCase)).ToList();
             }
-            interestingEnums.AddRange(types.Where(t => t.BaseType == typeof(Enum) && t.Name.IndexOf("register", StringComparison.CurrentCultureIgnoreCase) != -1));
 
             foreach(var interestingEnum in interestingEnums)
             {
@@ -69,11 +68,11 @@ namespace Antmicro.Renode.Peripherals.Bus.Wrappers
                 if(closestCandidates.Count > 0)
                 {
                     var closest = closestCandidates.Max();
-                    name = $"{map[closest]}+0x{offset - closest:x}";
+                    name = $"{map[closest]}+0x{offset - closest:x}{tagString}";
                 }
                 else
                 {
-                    name = "unknown";
+                    name = $"unknown{tagString}";
                 }
             }
             else
@@ -84,17 +83,7 @@ namespace Antmicro.Renode.Peripherals.Bus.Wrappers
             return name;
         }
 
+        private readonly string tagString;
         private readonly Dictionary<long, string> map = new Dictionary<long, string>();
-
-        [AttributeUsage(AttributeTargets.Enum)]
-        public class RegistersDescriptionAttribute : Attribute
-        {
-            public RegistersDescriptionAttribute(string tag = null)
-            {
-                Tag = tag;
-            }
-
-            public string Tag { get; }
-        }
     }
 }

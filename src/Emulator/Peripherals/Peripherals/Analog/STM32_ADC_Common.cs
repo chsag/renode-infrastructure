@@ -124,55 +124,7 @@ namespace Antmicro.Renode.Peripherals.Analog
             channelSelected = new bool[ADCChannelCount];
             Reset();
 
-            machine.PeripheralsChanged += (machine, ev) =>
-            {
-                /* We need to create default children as soon as this ADC peripheral exists.
-                 * However, the channel name must be unique at the machine level so the ADC name is
-                 * prefixed. The creation driver first register the ADC device and then sets its
-                 * local name. So the default children are created on the
-                 * PeripheralChangeType.NamedChanged event instead of PeripheralChangeType.Addition.
-                 */
-                if(ev.Peripheral == this && ev.Operation == PeripheralsChangedEventArgs.PeripheralChangeType.NameChanged)
-                {
-                    RegisterDefaultChildren(machine);
-                }
-            };
-        }
-
-        public void SetADCValue(int channel, uint valueMicroVolts)
-        {
-            IRESDSampleSource<VoltageSample> sampleSource;
-
-            this.AssertChannel(channel);
-
-            if(ADCContainer.TryGetByAddress(channel, out sampleSource) && sampleSource is ADCChannelSource channelSource)
-            {
-                this.WarningLog("This API is deprecated in favor of setting values from ADC sources");
-                channelSource.Sample = new VoltageSample(valueMicroVolts);
-            }
-            else
-            {
-                this.ErrorLog("Cannot set value for channel {0}, use ADC sources API", channel);
-            }
-        }
-
-        public uint GetADCValue(int channel)
-        {
-            IRESDSampleSource<VoltageSample> sampleSource;
-
-            this.AssertChannel(channel);
-
-            if(ADCContainer.TryGetByAddress(channel, out sampleSource))
-            {
-                this.WarningLog("This API is deprecated in favor of getting values from ADC sources");
-                return sampleSource.Sample.Voltage;
-            }
-            else
-            {
-                // This should not happen as at least a default children is registered.
-                this.ErrorLog("Cannot get value for channel {0}", channel);
-                return 0;
-            }
+            this.RegisterDefaultChildren(machine);
         }
 
         public void Reset()
@@ -209,22 +161,6 @@ namespace Antmicro.Renode.Peripherals.Analog
         public void WriteWord(long offset, ushort value)
         {
             RegistersCollection.Write(offset, value);
-        }
-
-        void IRegisterablePeripheral<IRESDSampleSource<VoltageSample>, NumberRegistrationPoint<int>>.Register(IRESDSampleSource<VoltageSample> peripheral, NumberRegistrationPoint<int> channel)
-        {
-            IRESDSampleSource<VoltageSample> sampleSource;
-
-            this.AssertChannel(channel.Address);
-
-            // Allow to register a new source over the default child.
-            if(ADCContainer.TryGetByAddress(channel.Address, out sampleSource) && sampleSource is ADCDefaultChannelSource)
-            {
-                ADCContainer.Unregister(sampleSource);
-            }
-
-            ADCContainer.Register(peripheral, channel);
-            peripheral.NewSample += newValue => WarnOnTooBigValue(channel.Address, (double)newValue.Voltage / 1e3); // µV to mV
         }
 
         public DoubleWordRegisterCollection RegistersCollection { get => registers; }
@@ -298,17 +234,21 @@ namespace Antmicro.Renode.Peripherals.Analog
                 this.Log(LogLevel.Warning, "Issued a start event before the last sequence finished");
                 return;
             }
+
+            sequenceInProgress = true;
+            startFlag.Value = true;
+
             if(hasChannelSelect)
             {
-                currentChannel = (scanDirection == ScanDirection.Ascending) ? 0 : ADCChannelCount - 1;
+                // NOTE: We set current channel out of bounds to switch to first active channel
+                currentChannel = (scanDirection == ScanDirection.Ascending) ? -1 : ADCChannelCount;
+                SwitchToNextActiveChannel();
             }
             else
             {
                 sequenceCounter = (scanDirection == ScanDirection.Ascending) ? 0 : (int)regularSequenceLength.Value;
                 currentChannel = (int)regularSequence[sequenceCounter].Value;
             }
-            sequenceInProgress = true;
-            startFlag.Value = true;
             SampleNextChannel();
         }
 
@@ -369,15 +309,10 @@ namespace Antmicro.Renode.Peripherals.Analog
                 return;
             }
 
-            // Skip disabled channels
-            while(hasChannelSelect && sequenceInProgress && !channelSelected[currentChannel])
-            {
-                SwitchToNextChannel();
-            }
-
             if(sequenceInProgress)
             {
                 uint sample = GetSampleFromChannel(currentChannel);
+                WarnOnTooBigValue(currentChannel, (double)sample / 1e3); // µV to mV
                 if(!adcOverrunFlag.Value || overrunMode.Value)
                 {
                     data.Value = ClampSample(sample, data.Width);
@@ -401,13 +336,13 @@ namespace Antmicro.Renode.Peripherals.Analog
                 }
                 endOfConversionFlag.Value = true;
                 this.Log(LogLevel.Debug, "Sampled channel {0}", currentChannel);
-                SwitchToNextChannel();
+                if(dmaEnabled.Value && !adcOverrunFlag.Value)
+                {
+                    SendDmaRequest();
+                }
+                SwitchToNextActiveChannel();
             }
 
-            if(dmaEnabled.Value && !adcOverrunFlag.Value)
-            {
-                SendDmaRequest();
-            }
             if(!sequenceInProgress && awaitingConversion)
             {
                 awaitingConversion = false;
@@ -452,25 +387,20 @@ namespace Antmicro.Renode.Peripherals.Analog
             UpdateInterrupts();
         }
 
-        private void SwitchToNextChannel()
+        private void SwitchToNextActiveChannel()
         {
-            bool iterationFinished;
-            if(hasChannelSelect)
+            if(!sequenceInProgress)
             {
-                currentChannel = (scanDirection == ScanDirection.Ascending) ? currentChannel + 1 : currentChannel - 1;
-
-                iterationFinished = currentChannel >= ADCChannelCount || currentChannel < 0;
+                WarnOnCurrentChannelNotPreselected();
+                return;
             }
-            else
+
+            var iterationFinished = false;
+            do
             {
-                sequenceCounter = (scanDirection == ScanDirection.Ascending) ? sequenceCounter + 1 : sequenceCounter - 1;
-                if(sequenceCounter >= 0 && sequenceCounter <= (int)regularSequenceLength.Value)
-                {
-                    currentChannel = (int)regularSequence[sequenceCounter].Value;
-                }
-
-                iterationFinished = sequenceCounter > (int)regularSequenceLength.Value || sequenceCounter < 0 || currentChannel < 0;
+                iterationFinished = SwitchToNextChannel();
             }
+            while(!iterationFinished && hasChannelSelect && !channelSelected[currentChannel]);
 
             if(iterationFinished)
             {
@@ -480,9 +410,23 @@ namespace Antmicro.Renode.Peripherals.Analog
                 startFlag.Value = false;
                 sequenceInProgress = false;
             }
+        }
+
+        private bool SwitchToNextChannel()
+        {
+            if(hasChannelSelect)
+            {
+                currentChannel = (scanDirection == ScanDirection.Ascending) ? currentChannel + 1 : currentChannel - 1;
+                return currentChannel >= ADCChannelCount || currentChannel < 0;
+            }
             else
             {
-                WarnOnCurrentChannelNotPreselected();
+                sequenceCounter = (scanDirection == ScanDirection.Ascending) ? sequenceCounter + 1 : sequenceCounter - 1;
+                if(sequenceCounter >= 0 && sequenceCounter <= (int)regularSequenceLength.Value)
+                {
+                    currentChannel = (int)regularSequence[sequenceCounter].Value;
+                }
+                return sequenceCounter > (int)regularSequenceLength.Value || sequenceCounter < 0 || currentChannel < 0;
             }
         }
 
@@ -1112,19 +1056,6 @@ namespace Antmicro.Renode.Peripherals.Analog
                 reservedBitsWidth = 2 + reservedBitsEntries * 3;
                 smpr2.Reserved(32 - reservedBitsWidth, reservedBitsWidth);
                 registers.Add((long)Registers.SamplingTime2, smpr2);
-            }
-        }
-
-        private void RegisterDefaultChildren(IMachine machine)
-        {
-            var adcName = "";
-            machine.TryGetLocalName(this, out adcName);
-
-            for(var i = 0; i < ADCChannelCount; i++)
-            {
-                IRESDSampleSource<VoltageSample> channelSource = new ADCDefaultChannelSource();
-                ((IADC)this).Register(channelSource, new NumberRegistrationPoint<int>(i));
-                machine.SetLocalName(channelSource, $"{adcName}-channel{i}");
             }
         }
 

@@ -36,6 +36,7 @@ namespace Antmicro.Renode.Peripherals.Analog
                 workMode: WorkMode.OneShot);
             samplingTimer.LimitReached += OnConversionFinished;
             ADCContainer = new SimpleContainerHelper<IRESDSampleSource<VoltageSample>>(machine, this);
+            this.RegisterDefaultChildren(machine);
         }
 
         public void FeedSamplesFromRESD(ReadFilePath filePath, uint adcChannel, uint resdChannel = 0,
@@ -61,35 +62,6 @@ namespace Antmicro.Renode.Peripherals.Analog
             base.Reset();
             samplingTimer.Reset();
             IRQ.Unset();
-        }
-
-        public void SetADCValue(int adcChannel, uint value)
-        {
-            IRESDSampleSource<VoltageSample> sampleSource;
-
-            EnsureChannelIsValid((uint)adcChannel);
-
-            if(ADCContainer.TryGetByAddress(adcChannel, out sampleSource) && sampleSource is ADCChannelSource channelSource)
-            {
-                channelSource.Sample = new VoltageSample(value);
-            }
-            else
-            {
-                rawVoltage[adcChannel] = value;
-            }
-        }
-
-        public uint GetADCValue(int adcChannel)
-        {
-            IRESDSampleSource<VoltageSample> sampleSource;
-
-            EnsureChannelIsValid((uint)adcChannel);
-
-            if(ADCContainer.TryGetByAddress(adcChannel, out sampleSource))
-            {
-                return sampleSource.Sample.Voltage;
-            }
-            return rawVoltage[adcChannel];
         }
 
         public GPIO IRQ { get; } = new GPIO();

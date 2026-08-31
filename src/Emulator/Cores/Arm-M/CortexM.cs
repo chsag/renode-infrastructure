@@ -1098,15 +1098,12 @@ namespace Antmicro.Renode.Peripherals.CPU
                     pcNotInitialized = false;
                     return;
                 }
-                if(sysbus.WhatPeripheralIsAt(pc, this, secureState) == null || (pc == 0 && sp == 0))
-                {
-                    this.Log(LogLevel.Error, "PC is in an unmapped region or PC and SP are equal to zero. Entering Lockup.");
-                    EnterResetLockup();
-                    pcNotInitialized = false;
-                    return;
-                }
                 this.Log(LogLevel.Info, "Setting initial values: PC = 0x{0:X}, SP = 0x{1:X}.", pc, sp);
-                PC = pc;
+                // Armv8-M ARM rule RKSCH and TakeReset(): reset vector bit[0]
+                // initializes EPSR.T. Bypass the Thumb-forcing patch in
+                // CortexM.BeforePCWrite() by writing the register directly.
+                SetRegisterValue32((int)CortexMRegisters.PC, base.BeforePCWrite(pc));
+                pcNotInitialized = false;
                 SP = sp;
             }
         }
@@ -1409,6 +1406,7 @@ namespace Antmicro.Renode.Peripherals.CPU
             public bool Privileged;
             public bool CpuSecure;
             public bool AttributionSecure;
+            public bool Semihosting;
 
             public static implicit operator ulong(ContextState stateObj)
             {
@@ -1416,6 +1414,7 @@ namespace Antmicro.Renode.Peripherals.CPU
                 state |= (stateObj.Privileged ? 1u : 0) & 1u;
                 state |= (stateObj.CpuSecure ? 2u : 0) & 2u;
                 state |= (stateObj.AttributionSecure ? 4u : 0) & 4u;
+                state |= (stateObj.Semihosting ? 8u : 0) & 8u;
                 return state;
             }
 
@@ -1426,6 +1425,7 @@ namespace Antmicro.Renode.Peripherals.CPU
                     Privileged = (state & 1u) == 1u,
                     CpuSecure = (state & 2u) == 2u,
                     AttributionSecure = (state & 4u) == 4u,
+                    Semihosting = (state & 8u) == 8u,
                 };
             }
         }
@@ -1520,13 +1520,15 @@ namespace Antmicro.Renode.Peripherals.CPU
 
         private static readonly CpuSignal FirstSignalNumber = CpuSignal.CpuWait;
 
-        private static readonly ContextState secureState = new ContextState { Privileged = true, CpuSecure = true, AttributionSecure = true };
+        private static readonly ContextState secureState = new ContextState { Privileged = true, CpuSecure = true, AttributionSecure = true, Semihosting = false };
 
+        /* Must be in sync with C structure in tlib in cpu_get_state_for_memory_transaction */
         private static readonly IReadOnlyDictionary<string, int> stateBits = new Dictionary<string, int>
         {
             ["privileged"] = 0,
             ["cpuSecure"] = 1,
             ["attributionSecure"] = 2,
+            ["semihosting"] = 3,
         };
     }
 }

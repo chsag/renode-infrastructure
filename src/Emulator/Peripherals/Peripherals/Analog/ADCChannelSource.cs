@@ -4,7 +4,6 @@
 // This file is licensed under the MIT License.
 // Full license text is available in 'licenses/MIT.txt'.
 //
-using System;
 
 using Antmicro.Renode.Exceptions;
 using Antmicro.Renode.Logging;
@@ -13,25 +12,25 @@ using Antmicro.Renode.Utilities.RESD;
 
 namespace Antmicro.Renode.Peripherals.Analog
 {
-    public class ADCChannelSource : IRESDSampleSource<VoltageSample>
+    public class ADCChannelSource : IFloatingVoltageSource
     {
         public ADCChannelSource(VoltageSample sample)
         {
-            defaultSample = sample;
+            DefaultSample = sample;
             resetSample = sample;
         }
 
         public ADCChannelSource(uint defaultValueMicroVolts = 0)
         {
-            defaultSample = new VoltageSample(defaultValueMicroVolts);
-            resetSample = defaultSample;
+            DefaultSample = new VoltageSample(defaultValueMicroVolts);
+            resetSample = DefaultSample;
         }
 
         public void Reset()
         {
             resdStream?.Dispose();
             resdStream = null;
-            defaultSample = resetSample;
+            DefaultSample = resetSample;
         }
 
         public void FeedSamplesFromRESD(ReadFilePath filePath, uint resdChannel = 0,
@@ -70,7 +69,6 @@ namespace Antmicro.Renode.Peripherals.Analog
                 resdStream?.Dispose();
                 resdStream = null;
                 DefaultSample = value;
-                NewSample?.Invoke(value);
             }
         }
 
@@ -87,20 +85,11 @@ namespace Antmicro.Renode.Peripherals.Analog
             }
         }
 
-        public VoltageSample DefaultSample
-        {
-            get => defaultSample;
-            set
-            {
-                defaultSample = value;
-            }
-        }
+        public VoltageSample DefaultSample { get; set; }
 
-        public event Action<VoltageSample> NewSample;
+        public bool IsFloating { get; set; }
 
         private RESDStream<VoltageSample> resdStream;
-
-        private VoltageSample defaultSample;
 
         private readonly VoltageSample resetSample;
     }
