@@ -23,7 +23,7 @@ using Range = Antmicro.Renode.Core.Range;
 
 namespace Antmicro.Renode.Peripherals.CAN
 {
-    public partial class NXP_FlexCAN : BasicDoubleWordPeripheral, IBytePeripheral, ICAN, IKnownSize
+    public partial class NXP_FlexCAN : BasicDoubleWordPeripheral, IBytePeripheral, IWordPeripheral, ICAN, IKnownSize
     {
         public NXP_FlexCAN(IMachine machine, uint numberOfMessageBuffers = 64, uint enhancedRxFifoSize = 0, uint baudRate = 1000000) : base(machine)
         {
@@ -126,6 +126,33 @@ namespace Antmicro.Renode.Peripherals.CAN
                 return;
             }
             RegistersCollection.Write(offset, value);
+        }
+
+        public ushort ReadWord(long offset)
+        {
+            if(messageBufferRange.Contains(offset))
+            {
+                var messageBufferOffset = offset - (long)messageBufferRange.StartAddress;
+                var alignedOffset = messageBufferOffset & ~0x3;
+                return (ushort)(messageBuffers.ReadDoubleWord(alignedOffset) >> (int)((messageBufferOffset & 0x2) * 8));
+            }
+            return this.ReadWordUsingDoubleWord(offset);
+        }
+
+        public void WriteWord(long offset, ushort value)
+        {
+            if(messageBufferRange.Contains(offset))
+            {
+                var messageBufferOffset = (ulong)offset - messageBufferRange.StartAddress;
+                var alignedOffset = messageBufferOffset & ~0x3UL;
+                var shift = (int)((messageBufferOffset & 0x2) * 8);
+                var previousValue = messageBuffers.ReadDoubleWord((long)alignedOffset);
+                var newValue = (previousValue & ~((uint)0xFFFF << shift)) | ((uint)value << shift);
+                messageBuffers.WriteDoubleWord((long)alignedOffset, newValue);
+                TryTransmitFromMessageBuffer(GetMessageBufferAddress(messageBufferOffset));
+                return;
+            }
+            this.WriteWordUsingDoubleWord(offset, value);
         }
 
         public byte ReadByte(long offset)
