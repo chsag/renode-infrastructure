@@ -971,12 +971,26 @@ namespace Antmicro.Renode.Peripherals.IRQControllers
             }
         }
 
+        public bool Clocked
+        {
+            get => systick.NonSecureVal.Clocked;
+            set
+            {
+                // Propagate setting to both security banks.
+                systick.NonSecureVal.Clocked = value;
+                if(cpu.TrustZoneEnabled)
+                {
+                    systick.SecureVal.Clocked = value;
+                }
+            }
+        }
+
         public bool HaltSystickOnDeepSleep { get; set; }
 
         /// <summary>
         /// Blocks writes to CCR.DIV_0_TRP register field so CPU wouldn't fault on integer division by 0
         /// </summary>
-        public bool FilterCcrDiv0Write { get; set; } = true;
+        public bool FilterCcrDiv0Write { get; set; } = false;
 
         [DefaultInterruptAttribute]
         public GPIO IRQ { get; private set; }
@@ -2954,6 +2968,15 @@ namespace Antmicro.Renode.Peripherals.IRQControllers
                 set
                 {
                     systick.Divider = value;
+                }
+            }
+
+            public bool Clocked
+            {
+                get => systick.Clocked;
+                set
+                {
+                    systick.Clocked = value;
                 }
             }
 

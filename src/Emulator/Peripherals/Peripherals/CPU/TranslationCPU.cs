@@ -388,7 +388,7 @@ namespace Antmicro.Renode.Peripherals.CPU
 
         public virtual void OnGPIO(int number, bool value)
         {
-            lock(lck)
+            lock(gpioLock)
             {
                 if(ThreadSentinelEnabled)
                 {
@@ -439,20 +439,10 @@ namespace Antmicro.Renode.Peripherals.CPU
             return pauseGuard.RequestTranslationBlockRestart(quiet);
         }
 
-        public uint AssembleBlock(ulong addr, string instructions, string triple = null, bool alternateDialect = false)
+        public void RequestWakeUpFromWfi()
         {
-            if(Assembler == null)
-            {
-                throw new RecoverableException("Assembler not available");
-            }
-
-            // Instruction fetch access used as we want to be able to write even pages mapped for execution only
-            // We don't care if translation fails here (the address is unchanged in this case)
-            TryTranslateAddress(addr, MpuAccess.InstructionFetch, out addr);
-
-            var result = Assembler.AssembleBlock(addr, instructions, triple, alternateDialect);
-            Bus.WriteBytes(result, addr, context: this);
-            return (uint)result.Length;
+            wakeUpFromWfiRequested = true;
+            sleeper.Interrupt();
         }
 
         public uint GetMmuWindowPrivileges(ulong id)
@@ -680,24 +670,13 @@ namespace Antmicro.Renode.Peripherals.CPU
 
         public void ActivateNewHooks() => hooks.ActivateNewHooks();
 
-        public string DisassembleBlock(ulong addr = ulong.MaxValue, uint blockSize = 40, string triple = null, bool alternateDialect = false)
+        public string GetCurrentLLVMTriple(out ulong pc)
         {
-            if(Disassembler == null)
+            lock(executionLock)
             {
-                throw new RecoverableException("Disassembly engine not available");
+                pc = PC;
+                return GetLLVMTriple(DisassemblyFlags);
             }
-            if(addr == ulong.MaxValue)
-            {
-                addr = PC;
-            }
-
-            // Instruction fetch access used as we want to be able to read even pages mapped for execution only
-            // We don't care if translation fails here (the address is unchanged in this case)
-            TryTranslateAddress(addr, MpuAccess.InstructionFetch, out addr);
-
-            var opcodes = Bus.ReadBytes(addr, (int)blockSize, context: this);
-            Disassembler.DisassembleBlock(addr, opcodes, triple, alternateDialect, out var result);
-            return result;
         }
 
         public override ExecutionResult ExecuteInstructions(ulong numberOfInstructionsToExecute, out ulong numberOfExecutedInstructions)
@@ -830,7 +809,11 @@ namespace Antmicro.Renode.Peripherals.CPU
 
         public string PreservableName => $"TranslationCPU:{this.GetName()}";
 
-        public LLVMDisassembler Disassembler => disassembler;
+        public LLVMDisas LLVMDisasContainer { get; init; }
+
+        public LLVMAssembler Assembler => LLVMDisasContainer.Assembler;
+
+        public LLVMDisassembler Disassembler => LLVMDisasContainer.Disassembler;
 
         public uint PageSize
         {
@@ -941,8 +924,9 @@ namespace Antmicro.Renode.Peripherals.CPU
             }
         }
 
-        // This value should only be read in CPU hooks (during execution of translated code).
-        public uint CurrentBlockDisassemblyFlags => TlibGetCurrentTbDisasFlags();
+        // This value can only be read safely from the CPU thread itself
+        // (including from C# callbacks), or when the CPU is not being executed
+        public uint DisassemblyFlags => TlibGetDisasFlags();
 
         public uint ExternalMmuWindowsCount => TlibGetMmuWindowsCount();
 
@@ -1025,8 +1009,6 @@ namespace Antmicro.Renode.Peripherals.CPU
 
         public uint IRQ { get { return TlibIsIrqSet(); } }
 
-        public LLVMAssembler Assembler => assembler;
-
         // TODO: improve this when backend/analyser stuff is done
 
         public bool UpdateContextOnLoadAndStore { get; set; }
@@ -1050,21 +1032,6 @@ namespace Antmicro.Renode.Peripherals.CPU
         }
 
         public bool DisableInterruptsWhileStepping { get; set; }
-
-        public override bool IsHalted
-        {
-            get => base.IsHalted;
-            set
-            {
-                if(base.IsHalted == value)
-                {
-                    return;
-                }
-                base.IsHalted = value;
-
-                TlibInvalidateTranslationCache();
-            }
-        }
 
         public abstract List<GDBFeatureDescriptor> GDBFeatures { get; }
 
@@ -1100,7 +1067,8 @@ namespace Antmicro.Renode.Peripherals.CPU
             this.UseMachineAtomicState = useMachineAtomicState;
             InitializeRegisters();
             Init();
-            InitDisas();
+            InitDirtyPointers();
+            LLVMDisasContainer = new LLVMDisas(this);
             Clustered = new TranslationCPU[] { this };
         }
 
@@ -1118,6 +1086,12 @@ namespace Antmicro.Renode.Peripherals.CPU
         protected virtual void LogAsCpu(int level, string s)
         {
             this.Log((LogLevel)level, s);
+        }
+
+        protected override void UpdateRequestedHaltedState()
+        {
+            base.UpdateRequestedHaltedState();
+            TlibInvalidateTranslationCache();
         }
 
         protected override void DisposeInner(bool silent = false)
@@ -1155,24 +1129,8 @@ namespace Antmicro.Renode.Peripherals.CPU
         }
 
         [PostDeserialization]
-        protected void InitDisas()
+        protected void InitDirtyPointers()
         {
-            try
-            {
-                disassembler = new LLVMDisassembler(this);
-            }
-            catch(ArgumentOutOfRangeException)
-            {
-                this.Log(LogLevel.Warning, "Could not initialize disassembly engine");
-            }
-            try
-            {
-                assembler = new LLVMAssembler(this);
-            }
-            catch(ArgumentOutOfRangeException)
-            {
-                this.Log(LogLevel.Warning, "Could not initialize assembly engine");
-            }
             dirtyAddressesPtr = IntPtr.Zero;
             addressesToInvalidate = new List<IntPtr>();
         }
@@ -1507,8 +1465,9 @@ namespace Antmicro.Renode.Peripherals.CPU
             }
             else if(result == ExecutionResult.WaitingForInterrupt && lastTlibResult != TlibExecutionResult.Lockup)
             {
-                if(InDebugMode || neverWaitForInterrupt)
+                if(InDebugMode || neverWaitForInterrupt || wakeUpFromWfiRequested)
                 {
+                    wakeUpFromWfiRequested = false;
                     // NIP always points to the next instruction, on all emulated cores. If this behavior changes, this needs to change as well.
                     this.Trace("Clearing WaitForInterrupt processor state.");
                     TlibCleanWfiProcState(); // Clean WFI state in the emulated core
@@ -2152,6 +2111,7 @@ namespace Antmicro.Renode.Peripherals.CPU
         private ExternalMmuFaultHook mmuFaultHook;
         private MemoryAccessHook memoryAccessHook;
         private Action<bool> wfiStateChangeHook;
+        private volatile bool wakeUpFromWfiRequested;
 
         private List<SegmentMapping> currentMappings;
 
@@ -2167,12 +2127,6 @@ namespace Antmicro.Renode.Peripherals.CPU
 
         [Transient]
         private SimpleMemoryManager memoryManager;
-
-        [Transient]
-        private LLVMAssembler assembler;
-
-        [Transient]
-        private LLVMDisassembler disassembler;
 
         [Transient]
         private bool disposed;
@@ -2238,7 +2192,7 @@ namespace Antmicro.Renode.Peripherals.CPU
         private readonly Action<uint> TlibSetInterruptBeginHookPresent;
 
         [Import]
-        private readonly Func<uint> TlibGetCurrentTbDisasFlags;
+        private readonly Func<uint> TlibGetDisasFlags;
 
         [Import]
         private readonly Action<ulong, ulong, uint> TlibSetMmuWindowEnd;
@@ -2405,8 +2359,7 @@ namespace Antmicro.Renode.Peripherals.CPU
 
         private readonly ConcurrentQueue<Action> actionsToExecuteOnCpuThread = new ConcurrentQueue<Action>();
 
-        // TODO
-        private readonly object lck = new object();
+        private readonly object gpioLock = new object();
         private readonly object executionLock = new object();
         private readonly MinimalRangesCollection mappedMemory = new MinimalRangesCollection();
         private readonly CpuThreadPauseGuard pauseGuard;

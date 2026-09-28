@@ -147,7 +147,7 @@ namespace Antmicro.Renode.Core
         {
             var entries = ClockSource.GetAllClockEntries();
 
-            var table = new Table().AddRow("Owner", "Enabled", "Frequency", "Limit", "Value", "Step", "Event frequency", "Event period");
+            var table = new Table().AddRow("Owner", "Clocked", "Enabled", "Frequency", "Limit", "Value", "Step", "Event frequency", "Event period");
             table.AddRows(entries,
                 x =>
                 {
@@ -164,6 +164,7 @@ namespace Antmicro.Renode.Core
                                 ? GetAnyNameOrTypeName(ownerAsPeripheral)
                                 : owner.GetType().Name;
                 },
+                x => x.Clocked.ToString(),
                 x => x.Enabled.ToString(),
                 x => Misc.NormalizeDecimal(x.Frequency) + "Hz",
                 x => x.Period.ToString(),
@@ -340,7 +341,7 @@ namespace Antmicro.Renode.Core
             }
         }
 
-        public void RequestResetInSafeState(Action postReset = null, ICollection<IPeripheral> unresetable = null)
+        public void RequestResetInSafeState(Action postReset = null, ICollection<IPeripheral> unresetable = null, bool runRegisteredResetEvents = false)
         {
             Action softwareRequestedReset = null;
             softwareRequestedReset = () =>
@@ -352,6 +353,11 @@ namespace Antmicro.Renode.Core
                     {
                         peripheral.Reset();
                         PeripheralReset?.Invoke(this, peripheral);
+                    }
+
+                    if(runRegisteredResetEvents)
+                    {
+                        MachineReset?.Invoke(this);
                     }
                 }
                 postReset?.Invoke();
@@ -756,8 +762,8 @@ namespace Antmicro.Renode.Core
             MultiTreeNode<IPeripheral, IRegistrationPoint> result;
             if(TryFindSubnodeByName(registeredPeripherals.GetNode(SystemBus), splitPath[1], out result, SystemBusName, out longestMatch))
             {
-                peripheral = (T)result.Value;
-                return true;
+                peripheral = result.Value as T;
+                return result.Value is T;
             }
             peripheral = null;
             return false;
@@ -2239,6 +2245,16 @@ namespace Antmicro.Renode.Core
             {
                 get => (uint)machine.ClockSource.GetClockEntry(action).Frequency;
                 set => machine.ClockSource.ExchangeClockEntryWith(action, entry => entry.With(frequency: value));
+            }
+
+            public TimeInterval Period
+            {
+                get
+                {
+                    var entry = machine.ClockSource.GetClockEntry(action);
+                    return TimeInterval.FromTicks(entry.Period * TimeInterval.TicksPerSecond / entry.Frequency);
+                }
+                set => machine.ClockSource.ExchangeClockEntryWith(action, entry => entry.With(period: value.Ticks, frequency: TimeInterval.TicksPerSecond));
             }
 
             private ManagedThreadWrappingClockEntry(IMachine machine, Action action, Func<bool> stopCondition = null)
