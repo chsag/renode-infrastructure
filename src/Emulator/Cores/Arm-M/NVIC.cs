@@ -847,6 +847,7 @@ namespace Antmicro.Renode.Peripherals.IRQControllers
             canResetOnlyFromSecure = false;
             deepSleepOnlyFromSecure = false;
             binaryPointPosition.Reset();
+            basepri.Reset();
             hardFaultForced = false;
         }
 
@@ -971,12 +972,26 @@ namespace Antmicro.Renode.Peripherals.IRQControllers
             }
         }
 
+        public bool Clocked
+        {
+            get => systick.NonSecureVal.Clocked;
+            set
+            {
+                // Propagate setting to both security banks.
+                systick.NonSecureVal.Clocked = value;
+                if(cpu.TrustZoneEnabled)
+                {
+                    systick.SecureVal.Clocked = value;
+                }
+            }
+        }
+
         public bool HaltSystickOnDeepSleep { get; set; }
 
         /// <summary>
         /// Blocks writes to CCR.DIV_0_TRP register field so CPU wouldn't fault on integer division by 0
         /// </summary>
-        public bool FilterCcrDiv0Write { get; set; } = true;
+        public bool FilterCcrDiv0Write { get; set; } = false;
 
         [DefaultInterruptAttribute]
         public GPIO IRQ { get; private set; }
@@ -1076,7 +1091,7 @@ namespace Antmicro.Renode.Peripherals.IRQControllers
             Registers.InterruptControlState.Define(RegisterCollection)
                 .WithValueField(0, 9, FieldMode.Read, valueProviderCallback: _ => (uint)(activeIRQs.Count == 0 ? 0 : activeIRQs.Peek()), name: "VECTACTIVE")
                 .WithReservedBits(9, 2)
-                .WithFlag(11, FieldMode.Read, valueProviderCallback: _ => activeIRQs.Intersect(Enum.GetValues(typeof(SystemException)).Cast<int>()).Count() <= 1, name: "RETTOBASE")
+                .WithFlag(11, FieldMode.Read, valueProviderCallback: _ => activeIRQs.Count() <= 1, name: "RETTOBASE")
                 .WithValueField(12, 9, FieldMode.Read, valueProviderCallback: _ => (ulong)(FindPendingInterrupt() ?? 0), name: "VECTPENDING")
                 .WithReservedBits(21, 1)
                 .WithTaggedFlag("ISRPENDING", 22)
@@ -2243,7 +2258,7 @@ namespace Antmicro.Renode.Peripherals.IRQControllers
 
             // when SEVONPEND is set all interrupts (even those masked)
             // generate an event when entering the pending state
-            if(before != irqs[i] && currentSevOnPending.Get(IsInterruptTargetNonSecure(i)))
+            if(before != irqs[i] && currentSevOnPending.Get(!IsInterruptTargetNonSecure(i)))
             {
                 foreach(var cpu in machine.SystemBus.GetCPUs().OfType<CortexM>())
                 {
@@ -2871,6 +2886,8 @@ namespace Antmicro.Renode.Peripherals.IRQControllers
             {
                 systickEnabled = false;
                 reloadValue = 0;
+                TickInterruptEnabled = false;
+                CountFlag = false;
 
                 systick.Reset();
                 systick.AutoUpdate = true;
@@ -2954,6 +2971,15 @@ namespace Antmicro.Renode.Peripherals.IRQControllers
                 set
                 {
                     systick.Divider = value;
+                }
+            }
+
+            public bool Clocked
+            {
+                get => systick.Clocked;
+                set
+                {
+                    systick.Clocked = value;
                 }
             }
 
