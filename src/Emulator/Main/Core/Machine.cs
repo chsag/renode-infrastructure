@@ -147,7 +147,7 @@ namespace Antmicro.Renode.Core
         {
             var entries = ClockSource.GetAllClockEntries();
 
-            var table = new Table().AddRow("Owner", "Enabled", "Frequency", "Limit", "Value", "Step", "Event frequency", "Event period");
+            var table = new Table().AddRow("Owner", "Clocked", "Enabled", "Frequency", "Limit", "Value", "Step", "Event frequency", "Event period");
             table.AddRows(entries,
                 x =>
                 {
@@ -164,6 +164,7 @@ namespace Antmicro.Renode.Core
                                 ? GetAnyNameOrTypeName(ownerAsPeripheral)
                                 : owner.GetType().Name;
                 },
+                x => x.Clocked.ToString(),
                 x => x.Enabled.ToString(),
                 x => Misc.NormalizeDecimal(x.Frequency) + "Hz",
                 x => x.Period.ToString(),
@@ -340,7 +341,7 @@ namespace Antmicro.Renode.Core
             }
         }
 
-        public void RequestResetInSafeState(Action postReset = null, ICollection<IPeripheral> unresetable = null)
+        public void RequestResetInSafeState(Action postReset = null, ICollection<IPeripheral> unresetable = null, bool runRegisteredResetEvents = false)
         {
             Action softwareRequestedReset = null;
             softwareRequestedReset = () =>
@@ -352,6 +353,11 @@ namespace Antmicro.Renode.Core
                     {
                         peripheral.Reset();
                         PeripheralReset?.Invoke(this, peripheral);
+                    }
+
+                    if(runRegisteredResetEvents)
+                    {
+                        MachineReset?.Invoke(this);
                     }
                 }
                 postReset?.Invoke();
@@ -498,6 +504,21 @@ namespace Antmicro.Renode.Core
                 catch(SocketException e)
                 {
                     throw new RecoverableException(string.Format("Could not start GDB server for {0}: {1}", cpuSupportingGdb.GetName(), e.Message));
+                }
+            }
+        }
+
+        public void StartMultiprocessGdbServer(int port, List<ICluster<ICpuSupportingGdb>> clusters, bool autostartEmulation = true)
+        {
+            foreach(var (process, processId) in clusters.Zip(Enumerable.Range(1, clusters.Count)))
+            {
+                try
+                {
+                    AddCpusToGdbStub(port, autostartEmulation, process, processId);
+                }
+                catch(SocketException e)
+                {
+                    throw new RecoverableException($"Could not start GDB server for process {processId} ({Misc.PrettyPrintCollection(process, x => x.GetName())}): {e.Message}");
                 }
             }
         }
@@ -756,8 +777,8 @@ namespace Antmicro.Renode.Core
             MultiTreeNode<IPeripheral, IRegistrationPoint> result;
             if(TryFindSubnodeByName(registeredPeripherals.GetNode(SystemBus), splitPath[1], out result, SystemBusName, out longestMatch))
             {
-                peripheral = (T)result.Value;
-                return true;
+                peripheral = result.Value as T;
+                return result.Value is T;
             }
             peripheral = null;
             return false;
@@ -1678,7 +1699,7 @@ namespace Antmicro.Renode.Core
             }
         }
 
-        private void AddCpusToGdbStub(int port, bool autostartEmulation, IEnumerable<ICpuSupportingGdb> cpus)
+        private void AddCpusToGdbStub(int port, bool autostartEmulation, IEnumerable<ICpuSupportingGdb> cpus, int? pid = null)
         {
             foreach(var cpu in cpus)
             {
@@ -1688,30 +1709,30 @@ namespace Antmicro.Renode.Core
             {
                 foreach(var cpu in cpus)
                 {
-                    gdbStubs[port].AttachCPU(cpu);
+                    gdbStubs[port].AttachCPU(cpu, pid);
                     this.Log(LogLevel.Info, "CPU: {0} was added to GDB server running on port :{1}", cpu.GetName(), port);
                 }
             }
             else
             {
-                gdbStubs.Add(port, new GdbStub(this, cpus, port, autostartEmulation));
+                gdbStubs.Add(port, new GdbStub(this, cpus, port, autostartEmulation, pid));
                 this.Log(LogLevel.Info, "CPUs: {0} were added to a new GDB server created on port :{1}", Misc.PrettyPrintCollection(cpus, c => $"\"{c.GetName()}\""), port);
             }
         }
 
-        private void AddCpusToGdbStub(SocketServerProvider terminal, IEnumerable<ICpuSupportingGdb> cpus)
+        private void AddCpusToGdbStub(SocketServerProvider terminal, IEnumerable<ICpuSupportingGdb> cpus, int? pid = null)
         {
             foreach(var cpu in cpus)
             {
                 CheckIsCpuAlreadyAttached(cpu);
             }
-            int port = terminal.Port.Value;
+            var port = terminal.Port.Value;
 
             if(gdbStubs.ContainsKey(port))
             {
                 throw new RecoverableException($"There is already a GdbStub for port ({port}) used by this Socket. Use port variant of this function if this is expected");
             }
-            gdbStubs.Add(port, new GdbStub(this, cpus, terminal));
+            gdbStubs.Add(port, new GdbStub(this, cpus, terminal, pid));
         }
 
         private void InnerUnregisterFromParent(IPeripheral peripheral)
@@ -2239,6 +2260,16 @@ namespace Antmicro.Renode.Core
             {
                 get => (uint)machine.ClockSource.GetClockEntry(action).Frequency;
                 set => machine.ClockSource.ExchangeClockEntryWith(action, entry => entry.With(frequency: value));
+            }
+
+            public TimeInterval Period
+            {
+                get
+                {
+                    var entry = machine.ClockSource.GetClockEntry(action);
+                    return TimeInterval.FromTicks(entry.Period * TimeInterval.TicksPerSecond / entry.Frequency);
+                }
+                set => machine.ClockSource.ExchangeClockEntryWith(action, entry => entry.With(period: value.Ticks, frequency: TimeInterval.TicksPerSecond));
             }
 
             private ManagedThreadWrappingClockEntry(IMachine machine, Action action, Func<bool> stopCondition = null)

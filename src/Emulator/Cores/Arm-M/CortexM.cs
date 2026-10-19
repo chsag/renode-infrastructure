@@ -241,19 +241,19 @@ namespace Antmicro.Renode.Peripherals.CPU
                 {
                     mProfileFeature.Registers.Add(new GDBRegisterDescriptor(index, 32, $"r{index}", "uint32", "general"));
                 }
-                mProfileFeature.Registers.Add(new GDBRegisterDescriptor(13, 32, "sp", "data_ptr", "general"));
-                mProfileFeature.Registers.Add(new GDBRegisterDescriptor(14, 32, "lr", "uint32", "general"));
-                mProfileFeature.Registers.Add(new GDBRegisterDescriptor(15, 32, "pc", "code_ptr", "general"));
-                mProfileFeature.Registers.Add(new GDBRegisterDescriptor(25, 32, "xpsr", "uint32", "general"));
+                mProfileFeature.Registers.Add(new GDBRegisterDescriptor((uint)CortexMRegisters.SP, 32, "sp", "data_ptr", "general"));
+                mProfileFeature.Registers.Add(new GDBRegisterDescriptor((uint)CortexMRegisters.LR, 32, "lr", "uint32", "general"));
+                mProfileFeature.Registers.Add(new GDBRegisterDescriptor((uint)CortexMRegisters.PC, 32, "pc", "code_ptr", "general"));
+                mProfileFeature.Registers.Add(new GDBRegisterDescriptor((uint)CortexMRegisters.CPSR, 32, "xpsr", "uint32", "general"));    // cpsr is aliased to xpsr in tlibs
                 features.Add(mProfileFeature);
 
                 var mSystemFeature = new GDBFeatureDescriptor("org.gnu.gdb.arm.m-system");
-                mSystemFeature.Registers.Add(new GDBRegisterDescriptor(26, 32, "msp", "uint32", "general"));
-                mSystemFeature.Registers.Add(new GDBRegisterDescriptor(27, 32, "psp", "uint32", "general"));
-                mSystemFeature.Registers.Add(new GDBRegisterDescriptor(28, 32, "primask", "uint32", "general"));
-                mSystemFeature.Registers.Add(new GDBRegisterDescriptor(29, 32, "basepri", "uint32", "general"));
-                mSystemFeature.Registers.Add(new GDBRegisterDescriptor(30, 32, "faultmask", "uint32", "general"));
-                mSystemFeature.Registers.Add(new GDBRegisterDescriptor(31, 32, "control", "uint32", "general"));
+                mSystemFeature.Registers.Add(new GDBRegisterDescriptor((uint)CortexMRegisters.MSPCURR, 32, "msp", "uint32", "general"));
+                mSystemFeature.Registers.Add(new GDBRegisterDescriptor((uint)CortexMRegisters.PSPCURR, 32, "psp", "uint32", "general"));
+                mSystemFeature.Registers.Add(new GDBRegisterDescriptor((uint)CortexMRegisters.PRIMASK, 32, "primask", "uint32", "general"));
+                mSystemFeature.Registers.Add(new GDBRegisterDescriptor((uint)CortexMRegisters.BasePri, 32, "basepri", "uint32", "general"));
+                mSystemFeature.Registers.Add(new GDBRegisterDescriptor((uint)CortexMRegisters.FAULTMASK, 32, "faultmask", "uint32", "general"));
+                mSystemFeature.Registers.Add(new GDBRegisterDescriptor((uint)CortexMRegisters.Control, 32, "control", "uint32", "general"));
                 features.Add(mSystemFeature);
 
                 bool hasMProfileVectorExtensions = GetArmFeature(ArmFeatures.ARM_FEATURE_MVE);
@@ -274,6 +274,12 @@ namespace Antmicro.Renode.Peripherals.CPU
                     mveProfileFeature.Registers.Add(new GDBRegisterDescriptor((uint)CortexMRegisters.VPR, 32, "vpr", "vpr_reg", "vector"));
                     features.Add(mveProfileFeature);
                 }
+                var mSecextFeature = new GDBFeatureDescriptor("org.gnu.gdb.arm.secext");
+                mSecextFeature.Registers.Add(new GDBRegisterDescriptor((uint)CortexMRegisters.MSPS, 32, "msp_s", "uint32", "general"));
+                mSecextFeature.Registers.Add(new GDBRegisterDescriptor((uint)CortexMRegisters.PSPS, 32, "psp_s", "uint32", "general"));
+                mSecextFeature.Registers.Add(new GDBRegisterDescriptor((uint)CortexMRegisters.MSPNS, 32, "msp_ns", "uint32", "general"));
+                mSecextFeature.Registers.Add(new GDBRegisterDescriptor((uint)CortexMRegisters.PSPNS, 32, "psp_ns", "uint32", "general"));
+                features.Add(mSecextFeature);
 
                 // +++++ Important
                 // tlibs implement VFP using DOUBLE PRECISION FP (64 bit) registers.
@@ -447,6 +453,19 @@ namespace Antmicro.Renode.Peripherals.CPU
         {
             get => GetTrustZoneRelatedRegister(nameof(PmsaV8Mair1_NS), () => tlibGetPmsav8Mair(1, 0));
             set => SetTrustZoneRelatedRegister(nameof(PmsaV8Mair1_NS), val => tlibSetPmsav8Mair(1, val, 0), value);
+        }
+
+        public bool MPUPrivdefena
+        {
+            get
+            {
+                return tlibIsPrivdefenaEnabled() != 0;
+            }
+
+            set
+            {
+                tlibSetPrivdefena(value ? 1u : 0u);
+            }
         }
 
         public bool MPUEnabled
@@ -1344,6 +1363,12 @@ namespace Antmicro.Renode.Peripherals.CPU
         private readonly Action<int> tlibEnableMpu;
 
         [Import]
+        private readonly Action<uint> tlibSetPrivdefena;
+
+        [Import]
+        private readonly Func<uint> tlibIsPrivdefenaEnabled;
+
+        [Import]
         private readonly Func<int> tlibIsMpuEnabled;
 
         [Import(Name = "tlib_set_register_value_32_non_secure")]
@@ -1419,11 +1444,11 @@ namespace Antmicro.Renode.Peripherals.CPU
 
             public static implicit operator ulong(ContextState stateObj)
             {
-                var state = 0u;
-                state |= (stateObj.Privileged ? 1u : 0) & 1u;
-                state |= (stateObj.CpuSecure ? 2u : 0) & 2u;
-                state |= (stateObj.AttributionSecure ? 4u : 0) & 4u;
-                state |= (stateObj.Semihosting ? 8u : 0) & 8u;
+                var state = 0UL;
+                state |= stateObj.Privileged ? 1UL : 0;
+                state |= stateObj.CpuSecure ? 2UL : 0;
+                state |= stateObj.AttributionSecure ? 4UL : 0;
+                state |= stateObj.Semihosting ? 8UL : 0;
                 return state;
             }
 
@@ -1431,10 +1456,10 @@ namespace Antmicro.Renode.Peripherals.CPU
             {
                 return new ContextState
                 {
-                    Privileged = (state & 1u) == 1u,
-                    CpuSecure = (state & 2u) == 2u,
-                    AttributionSecure = (state & 4u) == 4u,
-                    Semihosting = (state & 8u) == 8u,
+                    Privileged = (state & 1UL) == 1UL,
+                    CpuSecure = (state & 2UL) == 2UL,
+                    AttributionSecure = (state & 4UL) == 4UL,
+                    Semihosting = (state & 8UL) == 8UL,
                 };
             }
         }
