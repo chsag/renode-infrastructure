@@ -11,7 +11,6 @@ using System.IO;
 using System.Linq;
 using System.Text;
 
-using Antmicro.Renode.Config.Devices;
 using Antmicro.Renode.Core;
 using Antmicro.Renode.Core.Structure;
 using Antmicro.Renode.Exceptions;
@@ -27,20 +26,6 @@ namespace Antmicro.Renode.Utilities
 {
     public static class MachineExtensions
     {
-        public static void LoadPeripheralsFromJSONFile(this IMachine machine, String fileName)
-        {
-            if(!File.Exists(fileName))
-            {
-                throw new RecoverableException("Cannot load devices configuration from file {0} as it does not exist.".FormatWith(fileName));
-            }
-            new DevicesConfig(File.ReadAllText(fileName), machine);
-        }
-
-        public static void LoadPeripheralsFromJSONString(this IMachine machine, String text)
-        {
-            new DevicesConfig(text, machine);
-        }
-
         public static void LoadAtags(this IBusController bus, String bootargs, uint memorySize, uint beginAddress)
         {
             var atags = Misc.CreateAtags(bootargs, memorySize);
@@ -94,14 +79,14 @@ namespace Antmicro.Renode.Utilities
             byte[] disabledValue = Encoding.ASCII.GetBytes("disabled");
             foreach(var deviceName in disabledNodeNames)
             {
-                TreeNode node = fdt.Root.Descendants.FirstOrDefault(x => x.Name == deviceName);
+                var node = fdt.Root.Descendants.FirstOrDefault(x => x.Name == deviceName);
                 if(node == null)
                 {
                     throw new RecoverableException(String.Format("Device {0} not found.", deviceName));
                 }
                 else
                 {
-                    Property statusProperty = node.Properties.FirstOrDefault(x => x.Name == "status");
+                    var statusProperty = node.Properties.FirstOrDefault(x => x.Name == "status");
                     if(statusProperty != null)
                     {
                         node.Properties.Remove(statusProperty);

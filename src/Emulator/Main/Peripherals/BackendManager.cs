@@ -171,9 +171,16 @@ namespace Antmicro.Renode.Peripherals
 
         public void HideAnalyzersFor(IMachine machine)
         {
-            string name;
             var toRemove = new List<IAnalyzableBackendAnalyzer>();
-            foreach(var analyzer in activeAnalyzers.Where(x => machine.TryGetLocalName(x.Backend.AnalyzableElement as IPeripheral, out name)))
+            var connectedAnalyzers = activeAnalyzers.Where(x =>
+            {
+                if(x.Backend.AnalyzableElement as IPeripheral != null)
+                {
+                    return machine.TryGetLocalName(x.Backend.AnalyzableElement as IPeripheral, out var _);
+                }
+                return false;
+            });
+            foreach(var analyzer in connectedAnalyzers)
             {
                 analyzer.Hide();
                 toRemove.Add(analyzer);
@@ -217,18 +224,18 @@ namespace Antmicro.Renode.Peripherals
                 throw new RecoverableException("Unexpected state received while loading preserved state");
             }
 
-            foreach(KeyValuePair<IAnalyzableBackendAnalyzer, Tuple<string, string>> analyzerToTarget in analyzersTargets)
+            foreach(var analyzerToTarget in analyzersTargets)
             {
                 var analyzer = analyzerToTarget.Key;
                 analyzer.Clear();
                 var machineName = analyzerToTarget.Value.Item1;
                 var peripheralName = analyzerToTarget.Value.Item2;
-                if(!EmulationManager.Instance.CurrentEmulation.TryGetMachineByName(machineName, out IMachine machine))
+                if(!EmulationManager.Instance.CurrentEmulation.TryGetMachineByName(machineName, out var machine))
                 {
                     throw new RecoverableException($"Could not find machine {machineName} in Emulation!");
                 }
 
-                if(!EmulationManager.Instance.CurrentEmulation.TryGetEmulationElementByName(peripheralName, machine, out IEmulationElement emulationElement))
+                if(!EmulationManager.Instance.CurrentEmulation.TryGetEmulationElementByName(peripheralName, machine, out var emulationElement))
                 {
                     throw new RecoverableException($"Could not find peripheral {peripheralName} in {machineName}!");
                 }

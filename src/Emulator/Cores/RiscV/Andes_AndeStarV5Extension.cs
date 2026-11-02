@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2010-2025 Antmicro
+// Copyright (c) 2010-2026 Antmicro
 //
 // This file is licensed under the MIT License.
 // Full license text is available in 'licenses/MIT.txt'.
@@ -11,16 +11,13 @@ using Antmicro.Renode.Logging;
 using Antmicro.Renode.Peripherals.Bus;
 using Antmicro.Renode.Utilities;
 
+using Endianess = ELFSharp.ELF.Endianess;
+
 namespace Antmicro.Renode.Peripherals.CPU
 {
-    public class Andes_AndeStarV5Extension
+    public partial class Andes_AndeStarV5Extension
     {
-        public static void RegisterIn(IMachine machine, RiscV32 cpu)
-        {
-            new Andes_AndeStarV5Extension().RegisterInternal(machine, cpu);
-        }
-
-        private void RegisterInternal(IMachine machine, RiscV32 cpu)
+        public Andes_AndeStarV5Extension(IMachine machine, BaseRiscV cpu)
         {
             this.bus = machine.SystemBus;
             this.cpu = cpu;
@@ -34,14 +31,19 @@ namespace Antmicro.Renode.Peripherals.CPU
             // stub CSRs to make software happy
             cpu.RegisterCSR((ushort)CustomCSR.MachineExtendedStatus, () => 0x0, value => { cpu.Log(LogLevel.Warning, "Writing to the Machine Extended Status CSR (0x7c4) is currently not supported"); });
             cpu.RegisterCSR((ushort)CustomCSR.MachineCacheControl, () => 0xffffffff, value => { cpu.Log(LogLevel.Warning, "Writing to the Machine Cache Control CSR (0x7ca) is currently not supported"); });
+            cpu.RegisterCSRStub((ushort)CustomCSR.MachineCacheControlBeginAddress, "MCCTLBEGINADDR");
+            cpu.RegisterCSRStub((ushort)CustomCSR.MachineCacheControlCommand, "MCCTLCOMMAND");
+            cpu.RegisterCSRStub((ushort)CustomCSR.MachineCacheControlData, "MCCTLDATA");
             cpu.RegisterCSR((ushort)CustomCSR.InstructionCacheAndMemoryConfiguration, () => 0x0, value => { cpu.Log(LogLevel.Warning, "Writing to the Machine Custom read-only CSR (0xfc0) is not supported"); });
             cpu.RegisterCSR((ushort)CustomCSR.DataCacheAndMemoryConfiguration, () => 0x0, value => { cpu.Log(LogLevel.Warning, "Writing to the Machine Custom read-only CSR (0xfc1) is not supported"); });
             // Bit 16 is checked by Zephyr driver to see if CCTL is supported
-            cpu.RegisterCSR((ushort)CustomCSR.MachineMiscellaneousConfiguration, () => 0x0 | (1 << 16), value => { cpu.Log(LogLevel.Warning, "Writing to the Machine Custom read-only CSR (0xfc2) is not supported"); });
-            cpu.RegisterCSR((ushort)CustomCSR.MachineMiscellaneousConfigurationRV32, () => 0x0, value => { cpu.Log(LogLevel.Warning, "Writing to the Machine Custom read-only CSR (0xfc3) is not supported"); });
-            cpu.RegisterCSR((ushort)CustomCSR.VectorProcessorConfiguration, () => 0x0, value => { cpu.Log(LogLevel.Warning, "Writing to the Machine Custom read-only CSR (0xfc7) is not supported"); });
+            cpu.RegisterCSR((ushort)CustomCSR.MachineMiscellaneousConfiguration, () => ReadMiscellaneousConfiguration(), value => { cpu.Log(LogLevel.Warning, "Writing to the Machine Custom read-only CSR (0xfc2) is not supported"); });
+            cpu.RegisterCSR((ushort)CustomCSR.MachineMiscellaneousConfigurationRV32, () => ReadMiscellaneousConfiguration(upperWord: true), value => { cpu.Log(LogLevel.Warning, "Writing to the Machine Custom read-only CSR (0xfc3) is not supported"); });
+            cpu.RegisterCSR((ushort)CustomCSR.VectorProcessorConfiguration, ReadVectorConfiguration,
+                value => { cpu.Log(LogLevel.Warning, "Writing to the Machine Custom read-only CSR (0xfc7) is not supported"); });
             cpu.RegisterCSR((ushort)CustomCSR.ClusterCacheControlBaseAddress, () => 0x0, value => { cpu.Log(LogLevel.Warning, "Writing to the Machine Custom read-only CSR (0xfcf) is not supported"); });
-            cpu.RegisterCSR((ushort)CustomCSR.Architecture, () => 0x0, value => { cpu.Log(LogLevel.Warning, "Writing to the Machine Custom read-only CSR (0xfca) is not supported"); });
+            cpu.RegisterCSR((ushort)CustomCSR.Architecture, () => ReadArchitectureConfiguration(), value => { cpu.Log(LogLevel.Warning, "Writing to the Machine Custom read-only CSR (0xfca) is not supported"); });
+            cpu.RegisterCSR((ushort)CustomCSR.ArchitectureRV32, () => ReadArchitectureConfiguration(upperWord: true), value => { cpu.Log(LogLevel.Warning, "Writing to the Machine Custom read-only CSR (0xfcb) is not supported"); });
             cpu.RegisterCSR((ushort)CustomCSR.CurrentStateSaveForCrashDebugging, () => 0x0, value => { cpu.Log(LogLevel.Warning, "Writing to the Machine Custom read-only CSR (0xfc8) is not supported"); });
             cpu.RegisterCSR((ushort)CustomCSR.MstatusStateSaveForCrashDebugging, () => 0x0, value => { cpu.Log(LogLevel.Warning, "Writing to the Machine Custom read-only CSR (0xfc9) is not supported"); });
 
@@ -71,26 +73,194 @@ namespace Antmicro.Renode.Peripherals.CPU
             cpu.RegisterCSRStub((ushort)CustomCSR.PMAAddress13, "PMAADDR13");
             cpu.RegisterCSRStub((ushort)CustomCSR.PMAAddress14, "PMAADDR14");
             cpu.RegisterCSRStub((ushort)CustomCSR.PMAAddress15, "PMAADDR15");
+        }
+
+        public void RegisterPerformanceInstructions()
+        {
+            if(performanceRegistered)
+            {
+                return;
+            }
+            performanceRegistered = true;
 
             // Custom0
             cpu.InstallCustomInstruction("iiiiiiiiiiiiiiiiii00ddddd0001011", opc => ReadFromMemoryToRegister(opc, AccessWidth.Byte, LoadExtractorByte), "LBGP");
             cpu.InstallCustomInstruction("iiiiiiiiiiiiiiiiii10ddddd0001011", opc => ReadFromMemoryToRegister(opc, AccessWidth.Byte, LoadExtractorByte, extendSign: false), "LBUGP");
             cpu.InstallCustomInstruction("iiiiiiisssssiiiiii11iiiii0001011", opc => WriteRegisterToMemory(opc, AccessWidth.Byte, StoreExtractorByte), "SBGP");
+
             cpu.InstallCustomInstruction("iiiiiiiiiiiiiiiiii01ddddd0001011", HandleADDIGP, "ADDIGP");
 
             // Custom1
             cpu.InstallCustomInstruction("iiiiiiiiiiiiiiiii001ddddd0101011", opc => ReadFromMemoryToRegister(opc, AccessWidth.Word, LoadExtractorWord), "LHGP");
             cpu.InstallCustomInstruction("iiiiiiiiiiiiiiiii101ddddd0101011", opc => ReadFromMemoryToRegister(opc, AccessWidth.Word, LoadExtractorWord, extendSign: false), "LHUGP");
-            cpu.InstallCustomInstruction("iiiiiiisssssiiiii100iiiii0101011", opc => WriteRegisterToMemory(opc, AccessWidth.Word, StoreExtractorWord), "SHGP");
-            cpu.InstallCustomInstruction("iiiiiiiiiiiiiiiii010ddddd0101011", opc => ReadFromMemoryToRegister(opc, AccessWidth.DoubleWord, LoadExtractorDoubleWord), "LWGP");
+            cpu.InstallCustomInstruction("iiiiiiisssssiiiii000iiiii0101011", opc => WriteRegisterToMemory(opc, AccessWidth.Word, StoreExtractorWord), "SHGP");
+            cpu.InstallCustomInstruction("iiiiiiiiiiiiiiiii010ddddd0101011", opc => ReadFromMemoryToRegister(opc, AccessWidth.DoubleWord, LoadExtractorDoubleWord, 19), "LWGP");
             cpu.InstallCustomInstruction("iiiiiiisssssiiiii100iiiii0101011", opc => WriteRegisterToMemory(opc, AccessWidth.DoubleWord, StoreExtractorDoubleWord, 19), "SWGP");
+
+            // Custom2
+            cpu.InstallCustomInstruction(IsRV64 ? "i0iiiiicccccsssss111iiiic1011011" : "i0iiiiicccccsssss111iiii01011011", opc => BranchOnBitTest(opc, expectSet: false), "BBC");
+            cpu.InstallCustomInstruction(IsRV64 ? "i1iiiiicccccsssss111iiiic1011011" : "i1iiiiicccccsssss111iiii01011011", opc => BranchOnBitTest(opc, expectSet: true), "BBS");
+            cpu.InstallCustomInstruction("iciiiiicccccsssss101iiiic1011011", opc => BranchOnConstantComparison(opc, expectEqual: true), "BEQC");
+            cpu.InstallCustomInstruction("iciiiiicccccsssss110iiiic1011011", opc => BranchOnConstantComparison(opc, expectEqual: false), "BNEC");
+            cpu.InstallCustomInstruction(IsRV64 ? "mmmmmmllllllsssss011ddddd1011011" : "0mmmmm0lllllsssss011ddddd1011011", opc => HandleBitFieldOperation(opc, signExtend: true), "BFOS");
+            cpu.InstallCustomInstruction(IsRV64 ? "mmmmmmllllllsssss010ddddd1011011" : "0mmmmm0lllllsssss010ddddd1011011", opc => HandleBitFieldOperation(opc, signExtend: false), "BFOZ");
+            cpu.InstallCustomInstruction("0000101ssssssssss000ddddd1011011", opc => HandleLoadEffectiveAddress(opc, 1), "LEA.H");
+            cpu.InstallCustomInstruction("0000110ssssssssss000ddddd1011011", opc => HandleLoadEffectiveAddress(opc, 2), "LEA.W");
+            cpu.InstallCustomInstruction("0000111ssssssssss000ddddd1011011", opc => HandleLoadEffectiveAddress(opc, 3), "LEA.D");
+            if(IsRV64)
+            {
+                cpu.InstallCustomInstruction("0001000ssssssssss000ddddd1011011", opc => HandleLoadEffectiveAddress(opc, 0, zeroExtend: true), "LEA.B.ZE");
+                cpu.InstallCustomInstruction("0001001ssssssssss000ddddd1011011", opc => HandleLoadEffectiveAddress(opc, 1, zeroExtend: true), "LEA.H.ZE");
+                cpu.InstallCustomInstruction("0001010ssssssssss000ddddd1011011", opc => HandleLoadEffectiveAddress(opc, 2, zeroExtend: true), "LEA.W.ZE");
+                cpu.InstallCustomInstruction("0001011ssssssssss000ddddd1011011", opc => HandleLoadEffectiveAddress(opc, 3, zeroExtend: true), "LEA.D.ZE");
+            }
+            cpu.InstallCustomInstruction("0010000ssssssssss000ddddd1011011", HandleFFB, "FFB");
+            cpu.InstallCustomInstruction("0010001ssssssssss000ddddd1011011", HandleFFZMISM, "FFZMISM");
+            cpu.InstallCustomInstruction("0010010ssssssssss000ddddd1011011", opc => HandleMismatch(opc, findLast: false), "FFMISM");
+            cpu.InstallCustomInstruction("0010011ssssssssss000ddddd1011011", opc => HandleMismatch(opc, findLast: true), "FLMISM");
+
+            // TODO: CoDense extension (NDS.EXEC.IT/NDS.NEXEC.IT), and set mmsc_cfg (0xfc2) ECD (bit[3]).
         }
 
+        private static ulong LoadExtractorByte(ulong opcode)
+        {
+            return LoadExtractorWord(opcode) | BitHelper.GetValue(opcode, 14, 1);
+        }
+
+        private static ulong StoreExtractorByte(ulong opcode)
+        {
+            return StoreExtractorWord(opcode) | BitHelper.GetValue(opcode, 14, 1);
+        }
+
+        private static ulong LoadExtractorWord(ulong opcode)
+        {
+            return BitHelper.GetValue(opcode, 21, 10) << 1 |
+                BitHelper.GetValue(opcode, 20, 1) << 11 |
+                BitHelper.GetValue(opcode, 17, 3) << 12 |
+                BitHelper.GetValue(opcode, 15, 2) << 15 |
+                BitHelper.GetValue(opcode, 31, 1) << 17;
+        }
+
+        private static ulong StoreExtractorWord(ulong opcode)
+        {
+            // 18-bit imm[17:0], used by NDS.SBGP and NDS.SHGP
+            return BitHelper.GetValue(opcode, 8, 4) << 1 |
+                BitHelper.GetValue(opcode, 25, 6) << 5 |
+                BitHelper.GetValue(opcode, 7, 1) << 11 |
+                BitHelper.GetValue(opcode, 17, 3) << 12 |
+                BitHelper.GetValue(opcode, 15, 2) << 15 |
+                BitHelper.GetValue(opcode, 31, 1) << 17;
+        }
+
+        private static ulong StoreExtractorDoubleWord(ulong opcode)
+        {
+            // 19-bit imm[18:2], used by NDS.SWGP; note that imm[17] and imm[18] are encoded
+            // at bit 8 and bit 31 respectively
+            return BitHelper.GetValue(opcode, 9, 3) << 2 |
+                BitHelper.GetValue(opcode, 25, 6) << 5 |
+                BitHelper.GetValue(opcode, 7, 1) << 11 |
+                BitHelper.GetValue(opcode, 17, 3) << 12 |
+                BitHelper.GetValue(opcode, 15, 2) << 15 |
+                BitHelper.GetValue(opcode, 8, 1) << 17 |
+                BitHelper.GetValue(opcode, 31, 1) << 18;
+        }
+
+        private static ulong LoadExtractorDoubleWord(ulong opcode)
+        {
+            return BitHelper.GetValue(opcode, 22, 9) << 2 |
+                BitHelper.GetValue(opcode, 20, 1) << 11 |
+                BitHelper.GetValue(opcode, 17, 3) << 12 |
+                BitHelper.GetValue(opcode, 15, 2) << 15 |
+                BitHelper.GetValue(opcode, 21, 1) << 17 |
+                BitHelper.GetValue(opcode, 31, 1) << 18;
+        }
+
+        private ulong ReadMiscellaneousConfiguration(bool upperWord = false)
+        {
+            var value = 1ul << 16; // CCTL
+            if(cpu.SupportsInstructionSet(BaseRiscV.InstructionSet.V))
+            {
+                value |= 1ul << 36; // VECCFG
+            }
+            if(bfloat16Registered)
+            {
+                value |= 1ul << 32; // BF16CVT
+            }
+            if(packedInt4Registered)
+            {
+                value |= 1ul << 34; // VL4
+            }
+            if(packedFloat16Registered)
+            {
+                value |= 1ul << 44; // VPFH
+            }
+            if(dotProductRegistered)
+            {
+                value |= 1ul << 43; // VDOT
+            }
+            if(smallIntegerRegistered)
+            {
+                value |= 1ul << 40; // VSIH
+            }
+            if(quadMacRegistered)
+            {
+                value |= 1ul << 52; // RVARCH
+                if(!IsRV64)
+                {
+                    value |= 1ul << 60; // RVARCH2
+                }
+            }
+            if(!IsRV64 && (value >> 32) != 0)
+            {
+                value |= 1ul << 31; // MSC_EXT
+            }
+            return ReadConfiguration(value, upperWord);
+        }
+
+        private ulong ReadVectorConfiguration()
+        {
+            if(!cpu.SupportsInstructionSet(BaseRiscV.InstructionSet.V) || !cpu.SupportsInstructionSet(BaseRiscV.InstructionSet.F))
+            {
+                return 0;
+            }
+            var width = cpu.VectorElementMaxWidth;
+            var maximumFloatWidth = width >= 64 && cpu.SupportsInstructionSet(BaseRiscV.InstructionSet.D) ? 3ul
+                : width >= 32 ? 2ul : width >= 16 && (cpu.SupportsExtensionSet(BaseRiscV.StandardInstructionSetExtensions.ZVFH)
+                    || packedFloat16Registered
+                    || smallIntegerRegistered) ? 1ul : 0;
+            return maximumFloatWidth << 16;
+        }
+
+        private ulong ReadArchitectureConfiguration(bool upperWord = false)
+        {
+            var value = quadMacRegistered ? 1ul << 35 : 0;
+            return ReadConfiguration(value, upperWord);
+        }
+
+        private ulong ReadConfiguration(ulong value, bool upperWord)
+        {
+            if(IsRV64)
+            {
+                return upperWord ? 0 : value;
+            }
+            return upperWord ? value >> 32 : (uint)value;
+        }
+
+        private void WriteRegister(int register, ulong value)
+        {
+            // Writes to x0 are discarded.
+            if(register != 0)
+            {
+                cpu.SetRegister(register, MaskAddress(value));
+            }
+        }
+
+        // TODO: GP MMU/PMP/alignment handling, RV64-specific GP instructions.
         private void ReadFromMemoryToRegister(ulong opcode, AccessWidth width, Func<ulong, ulong> extractor, int immediateBits = 18, bool extendSign = true)
         {
-            var rd = (int)BitHelper.GetValue(opcode, 7, 5);
-            var imm = GetImmediate(opcode, extractor, immediateBits);
-            var memoryOffset = imm + cpu.GetRegister(MemoryOperationsImpliedRegister).RawValue;
+            var rd = BaseRiscV.GetRd(opcode);
+            var imm = BitHelper.SignExtend(extractor(opcode), immediateBits);
+            var memoryOffset = MaskAddress(imm + cpu.GetRegister(MemoryOperationsImpliedRegister).RawValue);
 
             int valueBits;
             ulong data;
@@ -115,21 +285,21 @@ namespace Antmicro.Renode.Peripherals.CPU
 
             if(extendSign)
             {
-                cpu.SetRegister(rd, BitHelper.SignExtend(data, valueBits));
+                WriteRegister(rd, BitHelper.SignExtend(data, valueBits));
             }
             else
             {
-                cpu.SetRegister(rd, data);
+                WriteRegister(rd, data);
             }
         }
 
         private void WriteRegisterToMemory(ulong opcode, AccessWidth width, Func<ulong, ulong> extractor, int immediateBits = 18)
         {
-            var rs2 = (int)BitHelper.GetValue(opcode, 20, 5);
-            var imm = GetImmediate(opcode, extractor, immediateBits);
-            var memoryOffset = imm + cpu.GetRegister(MemoryOperationsImpliedRegister).RawValue;
+            var rs2 = BaseRiscV.GetRs2(opcode);
+            var imm = BitHelper.SignExtend(extractor(opcode), immediateBits);
+            var memoryOffset = MaskAddress(imm + cpu.GetRegister(MemoryOperationsImpliedRegister).RawValue);
 
-            var regValue = cpu.GetRegister(rs2).RawValue;
+            var regValue = (uint)cpu.GetRegister(rs2).RawValue;
 
             switch(width)
             {
@@ -140,7 +310,7 @@ namespace Antmicro.Renode.Peripherals.CPU
                 bus.WriteWord(memoryOffset, (ushort)regValue, cpu);
                 break;
             case AccessWidth.DoubleWord:
-                bus.WriteDoubleWord(memoryOffset, (uint)regValue, cpu);
+                bus.WriteDoubleWord(memoryOffset, regValue, cpu);
                 break;
             default:
                 cpu.Log(LogLevel.Error, "Invalid memory access type: {0}", width);
@@ -150,74 +320,157 @@ namespace Antmicro.Renode.Peripherals.CPU
 
         private void HandleADDIGP(ulong opcode)
         {
-            var rd = (int)BitHelper.GetValue(opcode, 7, 5);
-            var imm = GetImmediate(opcode, LoadExtractorByte, 18);
+            var rd = BaseRiscV.GetRd(opcode);
+            var imm = BitHelper.SignExtend(LoadExtractorByte(opcode), 18);
             var value = imm + cpu.GetRegister(MemoryOperationsImpliedRegister).RawValue;
 
-            cpu.SetRegister(rd, value);
+            WriteRegister(rd, value);
         }
 
-        private ulong LoadExtractorByte(ulong opcode)
+        private void BranchOnBitTest(ulong opcode, bool expectSet)
         {
-            return LoadExtractorWord(opcode) | BitHelper.GetValue(opcode, 14, 1);
-        }
-
-        private ulong StoreExtractorByte(ulong opcode)
-        {
-            return StoreExtractorWord(opcode) | BitHelper.GetValue(opcode, 14, 1);
-        }
-
-        private ulong LoadExtractorWord(ulong opcode)
-        {
-            return BitHelper.GetValue(opcode, 21, 10) << 1 |
-                BitHelper.GetValue(opcode, 20, 1) << 11 |
-                BitHelper.GetValue(opcode, 17, 3) << 12 |
-                BitHelper.GetValue(opcode, 15, 2) << 15 |
-                BitHelper.GetValue(opcode, 31, 1) << 17;
-        }
-
-        private ulong StoreExtractorWord(ulong opcode)
-        {
-            return StoreExtractorDoubleWord(opcode) | (BitHelper.GetValue(opcode, 8, 1) << 1);
-        }
-
-        private ulong StoreExtractorDoubleWord(ulong opcode)
-        {
-            return BitHelper.GetValue(opcode, 9, 3) << 2 |
-                BitHelper.GetValue(opcode, 25, 6) << 5 |
-                BitHelper.GetValue(opcode, 7, 1) << 11 |
-                BitHelper.GetValue(opcode, 17, 3) << 12 |
-                BitHelper.GetValue(opcode, 15, 2) << 15 |
-                BitHelper.GetValue(opcode, 31, 1) << 17;
-        }
-
-        private ulong LoadExtractorDoubleWord(ulong opcode)
-        {
-            return BitHelper.GetValue(opcode, 22, 9) << 2 |
-                BitHelper.GetValue(opcode, 20, 1) << 11 |
-                BitHelper.GetValue(opcode, 17, 3) << 12 |
-                BitHelper.GetValue(opcode, 15, 2) << 15 |
-                BitHelper.GetValue(opcode, 21, 1) << 17 |
-                BitHelper.GetValue(opcode, 31, 1) << 18;
-        }
-
-        private ulong GetImmediate(ulong opcode, Func<ulong, ulong> valueExtractor, int bitCount, bool extendSign = true)
-        {
-            var value = valueExtractor(opcode);
-            if(extendSign)
+            var rs1Value = cpu.GetRegister(BaseRiscV.GetRs1(opcode)).RawValue;
+            var bitIndex = (byte)(BitHelper.GetValue(opcode, 20, 5) | (IsRV64 ? BitHelper.GetValue(opcode, 7, 1) << 5 : 0));
+            if(BitHelper.IsBitSet(rs1Value, bitIndex) == expectSet)
             {
-                return BitHelper.SignExtend(value, bitCount);
+                BranchRelative(opcode);
+            }
+        }
+
+        private void BranchOnConstantComparison(ulong opcode, bool expectEqual)
+        {
+            var constant = BitHelper.GetValue(opcode, 30, 1) << 6 |
+                BitHelper.GetValue(opcode, 7, 1) << 5 |
+                BitHelper.GetValue(opcode, 20, 5);
+            var rs1Value = cpu.GetRegister(BaseRiscV.GetRs1(opcode)).RawValue;
+            if((rs1Value == constant) == expectEqual)
+            {
+                BranchRelative(opcode);
+            }
+        }
+
+        private void BranchRelative(ulong opcode)
+        {
+            // 10-bit half-word offset: imm[10] at bit 31, imm[9:5] at bits 29-25, imm[4:1] at bits 11-8
+            var offset = BitHelper.GetValue(opcode, 31, 1) << 10 |
+                BitHelper.GetValue(opcode, 25, 5) << 5 |
+                BitHelper.GetValue(opcode, 8, 4) << 1;
+
+            var pc = cpu.PC.RawValue;
+            var target = pc + BitHelper.SignExtend(offset, 11);
+            cpu.PC = MaskAddress(target);
+        }
+
+        private void HandleBitFieldOperation(ulong opcode, bool signExtend)
+        {
+            var rd = BaseRiscV.GetRd(opcode);
+            var source = cpu.GetRegister(BaseRiscV.GetRs1(opcode)).RawValue;
+            var msb = (int)BitHelper.GetValue(opcode, 26, IsRV64 ? 6 : 5);
+            var lsb = (int)BitHelper.GetValue(opcode, 20, IsRV64 ? 6 : 5);
+
+            ulong result;
+            if(msb == 0)
+            {
+                // Zero-tailed bit-field insert.
+                result = (source & 1) == 0 ? 0 : signExtend ? ulong.MaxValue << lsb : 1ul << lsb;
+            }
+            else if(msb < lsb)
+            {
+                // Bit-field insert.
+                var length = lsb - msb + 1;
+                var field = BitHelper.GetValue(source, 0, length);
+                result = (signExtend ? BitHelper.SignExtend(field, length) : field) << msb;
             }
             else
             {
-                return value;
+                // Bit-field extract. A full-width field needs no sign extension.
+                var length = msb - lsb + 1;
+                var field = BitHelper.GetValue(source, lsb, length);
+                result = signExtend && length < 64 ? BitHelper.SignExtend(field, length) : field;
             }
+
+            WriteRegister(rd, result);
         }
+
+        private void HandleLoadEffectiveAddress(ulong opcode, int shift, bool zeroExtend = false)
+        {
+            var rd = BaseRiscV.GetRd(opcode);
+            var rs1 = cpu.GetRegister(BaseRiscV.GetRs1(opcode)).RawValue;
+            var rs2 = cpu.GetRegister(BaseRiscV.GetRs2(opcode)).RawValue;
+            if(zeroExtend)
+            {
+                rs2 = (uint)rs2;
+            }
+
+            WriteRegister(rd, rs1 + (rs2 << shift));
+        }
+
+        private void HandleFFB(ulong opcode)
+        {
+            // Every byte of Rs1 is compared against the least significant byte of Rs2
+            var compareByte = (byte)cpu.GetRegister(BaseRiscV.GetRs2(opcode)).RawValue;
+            FindByte(opcode, (rs1Byte, _) => rs1Byte == compareByte);
+        }
+
+        private void HandleFFZMISM(ulong opcode)
+        {
+            FindByte(opcode, (rs1Byte, rs2Byte) => rs1Byte == 0 || rs1Byte != rs2Byte);
+        }
+
+        private void HandleMismatch(ulong opcode, bool findLast)
+        {
+            FindByte(opcode, (rs1Byte, rs2Byte) => rs1Byte != rs2Byte, findLast);
+        }
+
+        private void FindByte(ulong opcode, Func<byte, byte, bool> predicate, bool findLast = false)
+        {
+            var rd = BaseRiscV.GetRd(opcode);
+            var rs1 = cpu.GetRegister(BaseRiscV.GetRs1(opcode)).RawValue;
+            var rs2 = cpu.GetRegister(BaseRiscV.GetRs2(opcode)).RawValue;
+
+            var result = 0;
+            for(var i = 0; i < RegisterBytes; i++)
+            {
+                var position = findLast ? (RegisterBytes - 1 - i) : i;
+                if(predicate(GetByte(rs1, position), GetByte(rs2, position)))
+                {
+                    // The position of the found byte is returned as a negative offset from the register size
+                    result = position - RegisterBytes;
+                    break;
+                }
+            }
+
+            WriteRegister(rd, (ulong)(long)result);
+        }
+
+        private byte GetByte(ulong value, int position)
+        {
+            // Position counts bytes in the data order, which depends on the CPU endianness
+            var bitOffset = 8 * (IsBigEndian ? (RegisterBytes - 1 - position) : position);
+            return (byte)((value >> bitOffset) & 0xFF);
+        }
+
+        private ulong MaskAddress(ulong address) => IsRV64 ? address : (uint)address;
+
+        private bool IsRV64 => cpu.Bitness == CpuBitness.Bits64;
+
+        private int RegisterBytes => IsRV64 ? 8 : 4;
+
+        private bool IsBigEndian => cpu.Endianness == Endianess.BigEndian;
 
         private ulong machineMiscellaneousControlValue;
 
-        private RiscV32 cpu;
-        private IBusController bus;
+        private bool bfloat16Registered;
+        private bool packedInt4Registered;
+        private bool packedFloat16Registered;
+        private bool dotProductRegistered;
+        private bool smallIntegerRegistered;
+        private bool quadMacRegistered;
+
+        private bool performanceRegistered;
+
+        private readonly BaseRiscV cpu;
+        private readonly IBusController bus;
 
         private const int AllowUnalignedAccessesBit = 6;
         private const int MemoryOperationsImpliedRegister = 3;
@@ -231,8 +484,11 @@ namespace Antmicro.Renode.Peripherals.CPU
 
         private enum CustomCSR : ulong
         {
-            MachineCacheControl = 0x7ca,
             MachineExtendedStatus = 0x7c4,
+            MachineCacheControl = 0x7ca,
+            MachineCacheControlBeginAddress = 0x7cb,
+            MachineCacheControlCommand = 0x7cc,
+            MachineCacheControlData = 0x7cd,
             MachineMiscellaneousControl = 0x7d0,
             InstructionCacheAndMemoryConfiguration = 0xfc0,
             DataCacheAndMemoryConfiguration = 0xfc1,
@@ -241,6 +497,7 @@ namespace Antmicro.Renode.Peripherals.CPU
             VectorProcessorConfiguration = 0xfc7,
             ClusterCacheControlBaseAddress = 0xfcf,
             Architecture = 0xfca,
+            ArchitectureRV32 = 0xfcb,
             CurrentStateSaveForCrashDebugging = 0xfc8,
             MstatusStateSaveForCrashDebugging = 0xfc9,
             UserITB = 0x800,

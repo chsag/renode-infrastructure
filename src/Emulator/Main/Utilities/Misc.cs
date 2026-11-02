@@ -14,6 +14,7 @@ using System.Linq;
 using System.Numerics;
 using System.Reflection;
 using System.Runtime.InteropServices;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.RegularExpressions;
 using System.Threading;
@@ -24,7 +25,9 @@ using Antmicro.Renode.Logging;
 using Antmicro.Renode.Logging.Profiling;
 using Antmicro.Renode.Network;
 using Antmicro.Renode.Peripherals;
+using Antmicro.Renode.Peripherals.Bus;
 using Antmicro.Renode.Peripherals.CPU;
+using Antmicro.Renode.Utilities.Packets;
 
 using Dynamitey;
 
@@ -459,14 +462,14 @@ namespace Antmicro.Renode.Utilities
             Action<uint> writeFunction;
             if(@this is ByteRegisterCollection)
             {
-                ByteRegisterCollection byteRegisterCollection = @this as ByteRegisterCollection;
+                var byteRegisterCollection = @this as ByteRegisterCollection;
                 innerOffset = 0;
                 previousValue = (uint)byteRegisterCollection.Read(register);
                 writeFunction = (data) => byteRegisterCollection.Write(register, (byte)data);
             }
             else if(@this is WordRegisterCollection)
             {
-                WordRegisterCollection wordRegisterCollection = @this as WordRegisterCollection;
+                var wordRegisterCollection = @this as WordRegisterCollection;
                 innerOffset = offset % 2;
                 if(msbFirst)
                 {
@@ -477,7 +480,7 @@ namespace Antmicro.Renode.Utilities
             }
             else if(@this is DoubleWordRegisterCollection)
             {
-                DoubleWordRegisterCollection doubleWordRegisterCollection = @this as DoubleWordRegisterCollection;
+                var doubleWordRegisterCollection = @this as DoubleWordRegisterCollection;
                 innerOffset = offset % 4;
                 if(msbFirst)
                 {
@@ -501,13 +504,13 @@ namespace Antmicro.Renode.Utilities
             uint outputValue;
             if(@this is ByteRegisterCollection)
             {
-                ByteRegisterCollection byteRegisterCollection = @this as ByteRegisterCollection;
+                var byteRegisterCollection = @this as ByteRegisterCollection;
                 innerOffset = 0;
                 outputValue = (uint)byteRegisterCollection.Read(register);
             }
             else if(@this is WordRegisterCollection)
             {
-                WordRegisterCollection wordRegisterCollection = @this as WordRegisterCollection;
+                var wordRegisterCollection = @this as WordRegisterCollection;
                 innerOffset = offset % 2;
                 if(msbFirst)
                 {
@@ -517,7 +520,7 @@ namespace Antmicro.Renode.Utilities
             }
             else if(@this is DoubleWordRegisterCollection)
             {
-                DoubleWordRegisterCollection doubleWordRegisterCollection = @this as DoubleWordRegisterCollection;
+                var doubleWordRegisterCollection = @this as DoubleWordRegisterCollection;
                 innerOffset = offset % 4;
                 if(msbFirst)
                 {
@@ -558,6 +561,14 @@ namespace Antmicro.Renode.Utilities
         {
             var structSize = Marshal.SizeOf(typeof(T));
             return @this.ReadBytes(structSize).ToStruct<T>();
+        }
+
+        public static T ReadStruct<T>(this IBusController bus, ulong baseAddress, uint index = 0,
+            IPeripheral context = null, ulong? contextState = null) where T : struct
+        {
+            var length = Packet.CalculateLength<T>();
+            var elementAddress = baseAddress + (ulong)length * index;
+            return Packet.Decode<T>(bus.ReadBytes(elementAddress, length, context: context, cpuState: contextState));
         }
 
         public static byte[] AsBytes(uint[] data)
@@ -636,7 +647,7 @@ namespace Antmicro.Renode.Utilities
 
         public static void Swap<T>(ref T a, ref T b)
         {
-            T temporary = a;
+            var temporary = a;
             a = b;
             b = temporary;
         }
@@ -863,7 +874,7 @@ namespace Antmicro.Renode.Utilities
         public static bool TryFromResourceToTemporaryFile(this Assembly assembly, string resourceName, out string outputFileFullPath, string nonstandardOutputFilename = null)
         {
             // `GetManifestResourceStream` is not supported by dynamic assemblies
-            Stream libraryStream = assembly.IsDynamic
+            var libraryStream = assembly.IsDynamic
                 ? null
                 : assembly.GetManifestResourceStream(resourceName);
 
@@ -1139,6 +1150,22 @@ namespace Antmicro.Renode.Utilities
         public static T AlignDownToMultipleOf<T>(this T value, T unit) where T : IBinaryInteger<T>
         {
             return value / unit * unit;
+        }
+
+        public static string TypePrettyName(Type type)
+        {
+            var genericArguments = type.GetGenericArguments();
+            if(genericArguments.Length == 0)
+            {
+                return type.Name;
+            }
+            if(type.GetGenericTypeDefinition() == typeof(Nullable<>) && genericArguments.Length == 1)
+            {
+                return genericArguments.Select(x => TypePrettyName(x) + "?").First();
+            }
+            var backtickIndex = type.Name.IndexOf("`", StringComparison.Ordinal);
+            var unmangledName = backtickIndex > 0 ? type.Name.Substring(0, backtickIndex) : type.Name;
+            return unmangledName + "<" + String.Join(",", genericArguments.Select(TypePrettyName)) + ">";
         }
 
         public static string PrettyPrintFlagsEnum(Enum enumeration)
@@ -1459,7 +1486,7 @@ namespace Antmicro.Renode.Utilities
             return (value != 0) && (value & (value - 1)) == 0;
         }
 
-        public static int NextPowerOfTwo(int value)
+        public static int RoundUpToPowerOfTwo(int value)
         {
             value--;
             value |= value >> 1;
@@ -1740,6 +1767,89 @@ namespace Antmicro.Renode.Utilities
             }
             result = default;
             return false;
+        }
+
+        public static R WaitForCallback<R>(this Action<Action<R>> func, CancellationToken token = default)
+        {
+            var mre = new ManualResetEventSlim();
+            var returnValue = default(R);
+            func(res =>
+            {
+                returnValue = res;
+                mre.Set();
+            });
+            mre.Wait(token);
+            return returnValue;
+        }
+
+        public static void WaitForCallback(this Action<Action> func, CancellationToken token = default)
+        {
+            var mre = new ManualResetEventSlim();
+            func(mre.Set);
+            mre.Wait(token);
+        }
+
+        // Just a big-endian increment on the last `counterSize` bytes of the `nonce`
+        public static void IncrementCtrCounter(byte[] nonce, uint counterSize)
+        {
+            if(counterSize > nonce.Length)
+            {
+                throw new ArgumentException("Counter size must not be greater than the size of the whole nonce");
+            }
+            // Starting from one because ^0 indexes one past the last item
+            for(var idx = 1; idx <= counterSize; idx += 1)
+            {
+                var newValue = unchecked(nonce[^idx] += 1);
+                if(newValue != 0)
+                {
+                    break;
+                }
+            }
+        }
+
+        public static void Xor(this Span<byte> dest, ReadOnlySpan<byte> operand)
+        {
+            if(dest.Length != operand.Length)
+            {
+                throw new ArgumentException("Destination and operand must be the same size");
+            }
+            for(var idx = 0; idx < dest.Length; idx += 1)
+            {
+                dest[idx] ^= operand[idx];
+            }
+        }
+
+        public static void EncryptCtr(this SymmetricAlgorithm algorithm, ReadOnlySpan<byte> plain, Span<byte> cypher, byte[] nonce, uint counterSize)
+        {
+            if(plain.Length != cypher.Length)
+            {
+                throw new ArgumentException("Plaintext and cyphertext spans must be the same size");
+            }
+            plain.CopyTo(cypher);
+            var pad = new byte[nonce.Length];
+            while(true)
+            {
+                algorithm.EncryptEcb(nonce, pad, PaddingMode.Zeros);
+                IncrementCtrCounter(nonce, counterSize);
+                if(cypher.Length <= pad.Length)
+                {
+                    cypher.Xor(pad[..cypher.Length]);
+                    break;
+                }
+                cypher[..pad.Length].Xor(pad);
+                cypher = cypher[pad.Length..];
+            }
+        }
+
+        public static IEnumerable<LinkedListNode<T>> Nodes<T>(this LinkedList<T> me)
+        {
+            var node = me.First;
+            while(node != null)
+            {
+                var next = node.Next;
+                yield return node;
+                node = next;
+            }
         }
 
         public static bool IsOnOsX

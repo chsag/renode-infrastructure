@@ -83,7 +83,7 @@ namespace Antmicro.Renode.Peripherals.CPU
                 this.Log(LogLevel.Warning, "Ignoring stepping on an aborted CPU");
                 return PC;
             }
-            if(IsHalted)
+            if(HasAnyHaltingCondition)
             {
                 this.Log(LogLevel.Warning, "Ignoring stepping on a halted CPU");
                 return PC;
@@ -252,40 +252,47 @@ namespace Antmicro.Renode.Peripherals.CPU
             }
         }
 
-        public override bool IsHalted
+        public bool Clocked
         {
             get
             {
-                return isHaltedRequested;
+                return clocked;
             }
 
             set
             {
                 this.Trace();
-                if(value == isHaltedRequested)
+                if(value == clocked)
                 {
                     return;
                 }
+                clocked = value;
 
-                lock(pauseLock)
-                {
-                    this.Trace();
-                    isHaltedRequested = value;
-
-                    if(value)
-                    {
-                        DoPause(new HaltArguments(HaltReason.Pause, this), checkPauseGuard: false);
-                    }
-                    else
-                    {
-                        if(!isPausedRequested)
-                        {
-                            Resume();
-                        }
-                    }
-                }
+                UpdateRequestedHaltedState();
             }
         }
+
+        public override bool IsHalted
+        {
+            get
+            {
+                return isHalted;
+            }
+
+            set
+            {
+                this.Trace();
+                if(value == isHalted)
+                {
+                    return;
+                }
+                isHalted = value;
+
+                UpdateRequestedHaltedState();
+            }
+        }
+
+        public override bool HasAnyHaltingCondition => base.HasAnyHaltingCondition || !Clocked || HaltedByDebugger;
 
         public bool OnPossessedThread
         {
@@ -320,6 +327,8 @@ namespace Antmicro.Renode.Peripherals.CPU
 
         public Endianess Endianness { get; }
 
+        public CpuBitness Bitness => bitness;
+
         //The debug mode disables interrupt handling in the emulated CPU
         //Additionally, some instructions, suspending execution, until an interrupt arrives (e.g. HLT on x86 or WFI on ARM) are treated as NOP
         public virtual bool ShouldEnterDebugMode
@@ -332,6 +341,21 @@ namespace Antmicro.Renode.Peripherals.CPU
                     this.Log(LogLevel.Warning, "The debug mode now has no effect - connect a debugger, and switch to stepping mode.");
                 }
                 shouldEnterDebugMode = value;
+            }
+        }
+
+        public virtual bool HaltedByDebugger
+        {
+            get => haltedByDebugger;
+            set
+            {
+                this.Trace();
+                if(value == haltedByDebugger)
+                {
+                    return;
+                }
+                haltedByDebugger = value;
+                UpdateRequestedHaltedState();
             }
         }
 
@@ -362,6 +386,7 @@ namespace Antmicro.Renode.Peripherals.CPU
             this.machine = machine;
             this.bitness = bitness;
             isPaused = true;
+            clocked = true;
 
             singleStepSynchronizer = new Synchronizer();
             EmulationManager.Instance.CurrentEmulation.SingleStepBlockingChanged += UpdateHaltedState;
@@ -417,6 +442,32 @@ namespace Antmicro.Renode.Peripherals.CPU
             lock(pauseLock)
             {
                 StartCPUThreadInner();
+            }
+        }
+
+        protected virtual void UpdateRequestedHaltedState()
+        {
+            lock(pauseLock)
+            {
+                this.Trace();
+                var value = isHalted || !clocked || haltedByDebugger;
+                if(isHaltedRequested == value)
+                {
+                    return;
+                }
+                isHaltedRequested = value;
+
+                if(isHaltedRequested)
+                {
+                    DoPause(new HaltArguments(HaltReason.Pause, this), checkPauseGuard: false);
+                }
+                else
+                {
+                    if(!isPausedRequested)
+                    {
+                        Resume();
+                    }
+                }
             }
         }
 
@@ -914,6 +965,9 @@ namespace Antmicro.Renode.Peripherals.CPU
         protected bool shouldEnterDebugMode;
         protected bool neverWaitForInterrupt;
         protected bool dispatcherRestartRequested;
+        protected bool clocked;
+        protected bool isHalted;
+        protected bool haltedByDebugger;
         protected bool isHaltedRequested;
         protected bool currentHaltedState;
 

@@ -30,6 +30,21 @@ namespace Antmicro.Renode.Peripherals.CPU
 {
     public abstract class BaseRiscV : TranslationCPU, IPeripheralContainer<ICFU, NumberRegistrationPoint<int>>, IPeripheralContainer<IIndirectCSRPeripheral, BusRangeRegistration>, IRegisterablePeripheral<ExternalPMPBase, NullRegistrationPoint>, ICPUWithPostGprAccessHooks, ICPUWithNMI, ICPUWithDirtyAdressesSharing
     {
+        public static int GetRd(ulong opcode)
+        {
+            return (int)BitHelper.GetValue(opcode, 7, 5);
+        }
+
+        public static int GetRs1(ulong opcode)
+        {
+            return (int)BitHelper.GetValue(opcode, 15, 5);
+        }
+
+        public static int GetRs2(ulong opcode)
+        {
+            return (int)BitHelper.GetValue(opcode, 20, 5);
+        }
+
         public void Register(ICFU cfu, NumberRegistrationPoint<int> registrationPoint)
         {
             var isRegistered = ChildCollection.Where(x => x.Value.Equals(cfu)).Select(x => x.Key).ToList();
@@ -309,6 +324,7 @@ namespace Antmicro.Renode.Peripherals.CPU
 
         public uint VectorElementMaxWidth
         {
+            get => vectorElementMaxWidth;
             set
             {
                 if(!SupportsInstructionSet(InstructionSet.V))
@@ -319,6 +335,7 @@ namespace Antmicro.Renode.Peripherals.CPU
                 {
                     throw new RecoverableException($"Attempted to set Vector Element Max Width (ELEN), but {value} is not a valid value");
                 }
+                vectorElementMaxWidth = value;
             }
         }
 
@@ -1141,6 +1158,7 @@ namespace Antmicro.Renode.Peripherals.CPU
 
         private CoreLocalInterruptController clic;
 
+        private uint vectorElementMaxWidth = 64;
         private ExternalPMPBase externalPMP;
 
         private bool pcWrittenFlag;
@@ -1365,6 +1383,7 @@ namespace Antmicro.Renode.Peripherals.CPU
             ZCB = 17,
             ZCMP = 18,
             ZCMT = 19,
+            ZICOND = 20,
         }
 
         public enum InterruptMode
@@ -1568,7 +1587,36 @@ namespace Antmicro.Renode.Peripherals.CPU
                     break;
                 case "SMEPMP": standardExtensions.Add(StandardInstructionSetExtensions.SMEPMP); break;
                 case "SSCOFPMF": standardExtensions.Add(StandardInstructionSetExtensions.SSCOFPMF); break;
-                case "XANDES": Andes_AndeStarV5Extension.RegisterIn(machine, (RiscV32)parent); break;
+                case "XANDES":
+                case "XANDESPERF": GetAndesExtension().RegisterPerformanceInstructions(); break;
+                case "XANDESBFHCVT":
+                    instructionSets.Add(InstructionSet.F);
+                    GetAndesExtension().RegisterBFloat16();
+                    break;
+                case "XANDESVBFHCVT":
+                    instructionSets.Add(InstructionSet.V);
+                    GetAndesExtension().RegisterBFloat16();
+                    break;
+                case "XANDESVSINTLOAD":
+                    instructionSets.Add(InstructionSet.V);
+                    GetAndesExtension().RegisterPackedInt4Loads();
+                    break;
+                case "XANDESVPACKFPH":
+                    instructionSets.Add(InstructionSet.V);
+                    GetAndesExtension().RegisterPackedFloat16();
+                    break;
+                case "XANDESVDOT":
+                    instructionSets.Add(InstructionSet.V);
+                    GetAndesExtension().RegisterDotProduct();
+                    break;
+                case "XANDESVSINTH":
+                    instructionSets.Add(InstructionSet.V);
+                    GetAndesExtension().RegisterSmallInteger();
+                    break;
+                case "XANDESVQMAC":
+                    instructionSets.Add(InstructionSet.V);
+                    GetAndesExtension().RegisterQuadMac();
+                    break;
                 case "ZBA": standardExtensions.Add(StandardInstructionSetExtensions.BA); break;
                 case "ZBB": standardExtensions.Add(StandardInstructionSetExtensions.BB); break;
                 case "ZBC": standardExtensions.Add(StandardInstructionSetExtensions.BC); break;
@@ -1576,6 +1624,7 @@ namespace Antmicro.Renode.Peripherals.CPU
                 case "ZBKB": standardExtensions.Add(StandardInstructionSetExtensions.BKB); break;
                 case "ZICSR": standardExtensions.Add(StandardInstructionSetExtensions.ICSR); break;
                 case "ZIFENCEI": standardExtensions.Add(StandardInstructionSetExtensions.IFENCEI); break;
+                case "ZICOND": standardExtensions.Add(StandardInstructionSetExtensions.ZICOND); break;
                 case "ZFH": standardExtensions.Add(StandardInstructionSetExtensions.ZFH); break;
                 case "ZVFH": standardExtensions.Add(StandardInstructionSetExtensions.ZVFH); break;
                 case "ZVE32X": standardExtensions.Add(StandardInstructionSetExtensions.ZVE32X); break;
@@ -1644,6 +1693,13 @@ namespace Antmicro.Renode.Peripherals.CPU
                     throw new ConstructionException($"RV32E can only have M, A and C standard extensions");
                 }
             }
+
+            private Andes_AndeStarV5Extension GetAndesExtension()
+            {
+                return andesExtension ??= new Andes_AndeStarV5Extension(machine, parent);
+            }
+
+            private Andes_AndeStarV5Extension andesExtension;
 
             private readonly ISet<StandardInstructionSetExtensions> standardExtensions;
             private readonly ISet<InstructionSet> instructionSets;

@@ -27,14 +27,15 @@ namespace Antmicro.Renode.Utilities
         {
             ulong minAddr = ulong.MaxValue;
 
-            foreach(FileChunk chunk in chunks)
+            foreach(var chunk in chunks)
             {
                 Logger.LogAs(
                     peripheral,
                     LogLevel.Info,
-                    "Loading block of {0} bytes length at 0x{1:X}.",
+                    "Loading block of {0} bytes length at 0x{1:X}{2}.",
                     chunk.Data.Count(),
-                    chunk.OffsetToLoad
+                    chunk.OffsetToLoad,
+                    cpu is not null ? $" with context {cpu}" : ""
                 );
                 var chunkData = chunk.Data.ToArray();
                 peripheral.WriteBytes((long)chunk.OffsetToLoad, chunkData, 0, chunkData.Length, context: cpu);

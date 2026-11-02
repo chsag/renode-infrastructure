@@ -12,9 +12,12 @@ using System.IO;
 using Antmicro.Renode.Analyzers;
 using Antmicro.Renode.Backends.Video;
 using Antmicro.Renode.Core;
+using Antmicro.Renode.Extensions.Analyzers;
 using Antmicro.Renode.Extensions.Analyzers.Video;
 using Antmicro.Renode.Logging;
 using Antmicro.Renode.Logging.Backends;
+using Antmicro.Renode.Peripherals.CAN;
+using Antmicro.Renode.Peripherals.SPI;
 using Antmicro.Renode.Peripherals.UART;
 using Antmicro.Renode.UserInterface;
 using Antmicro.Renode.Utilities;
@@ -47,9 +50,8 @@ namespace Antmicro.Renode.UI
             }
             if(options.ServerMode)
             {
-                // This is only http endoint - 29170 is used for backward compatibility with ws proxy
-                // it does not create new socket
-                Logger.AddBackend(new WebSocketNetworkBackend("/telnet/29170", false), "network");
+                Logger.AddBackend(new WebSocketNetworkBackend("/logs", false), "network");
+                new WebSocketUartServer();
             }
 
             Logger.AddBackend(new MemoryBackend(), "memory");
@@ -94,13 +96,17 @@ namespace Antmicro.Renode.UI
 
                 EmulationManager.Instance.ProgressMonitor.Handler = new CLIProgressMonitor();
 
-                Type uartAnalyzerType = typeof(ConsoleWindowBackendAnalyzer);
-                Type videoAnalyzerType = typeof(VideoAnalyzer);
+                var uartAnalyzerType = typeof(ConsoleWindowBackendAnalyzer);
+                var videoAnalyzerType = typeof(VideoAnalyzer);
+                var canAnalyzerType = typeof(DummyCANAnalyzer);
+                var spiAnalyzerType = typeof(DummySPIAnalyzer);
 
                 if(options.ServerMode)
                 {
                     uartAnalyzerType = typeof(WebSocketUartAnalyzer);
-                    videoAnalyzerType = typeof(DummyVideoAnalyzer);
+                    videoAnalyzerType = typeof(WebSocketVideoAnalyzer);
+                    canAnalyzerType = typeof(WebSocketCANAnalyzer);
+                    spiAnalyzerType = typeof(WebSocketSPIAnalyzer);
                 }
                 else if(ui == null || options.RobotDebug)
                 {
@@ -110,10 +116,14 @@ namespace Antmicro.Renode.UI
 
                 EmulationManager.Instance.CurrentEmulation.BackendManager.SetPreferredAnalyzer(typeof(UARTBackend), uartAnalyzerType);
                 EmulationManager.Instance.CurrentEmulation.BackendManager.SetPreferredAnalyzer(typeof(VideoBackend), videoAnalyzerType);
+                EmulationManager.Instance.CurrentEmulation.BackendManager.SetPreferredAnalyzer(typeof(CANBackend), canAnalyzerType);
+                EmulationManager.Instance.CurrentEmulation.BackendManager.SetPreferredAnalyzer(typeof(SPIBackend), spiAnalyzerType);
                 EmulationManager.Instance.EmulationChanged += () =>
                 {
                     EmulationManager.Instance.CurrentEmulation.BackendManager.SetPreferredAnalyzer(typeof(UARTBackend), uartAnalyzerType);
                     EmulationManager.Instance.CurrentEmulation.BackendManager.SetPreferredAnalyzer(typeof(VideoBackend), videoAnalyzerType);
+                    EmulationManager.Instance.CurrentEmulation.BackendManager.SetPreferredAnalyzer(typeof(CANBackend), canAnalyzerType);
+                    EmulationManager.Instance.CurrentEmulation.BackendManager.SetPreferredAnalyzer(typeof(SPIBackend), spiAnalyzerType);
                 };
 
                 var shell = PrepareShell(options, monitor);
@@ -123,12 +133,13 @@ namespace Antmicro.Renode.UI
                     Name = "Shell thread"
                 }.Start();
 
-                Emulator.BeforeExit += () =>
+                var cleanup = () =>
                 {
                     Emulator.DisposeAll();
                     ui?.Dispose();
                     ui = null;
                 };
+                Emulator.RegisterCleanUp(cleanup);
 
                 if(beforeRun != null)
                 {
@@ -192,7 +203,7 @@ namespace Antmicro.Renode.UI
             }
             else if(options.ServerMode)
             {
-                var socket = new WebSocketIOSource("/telnet/29169");
+                var socket = new WebSocketIOSource("/monitor");
                 ioSource = socket;
                 size = socket;
             }

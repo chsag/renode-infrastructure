@@ -21,9 +21,10 @@ namespace Antmicro.Renode.Testing
 {
     public class CANTester : ICAN, IExternal
     {
-        public CANTester(TimeInterval defaultTimeout)
+        public CANTester(TimeInterval defaultTimeout, bool defaultStartEmulation = true)
         {
             this.defaultTimeout = defaultTimeout;
+            this.defaultStartEmulation = defaultStartEmulation;
             frames = new List<CANMessageFrame>();
             matchedEvent = new AutoResetEvent(false);
             pauseEmulation = true;
@@ -122,7 +123,7 @@ namespace Antmicro.Renode.Testing
                     frameIndex++;
                 }
 
-                if(!emulation.IsStarted)
+                if(defaultStartEmulation && !emulation.IsStarted)
                 {
                     emulation.StartAll();
                 }
@@ -214,7 +215,7 @@ namespace Antmicro.Renode.Testing
         public void SendFrame(CANMessageFrame frame)
         {
             var emulation = EmulationManager.Instance.CurrentEmulation;
-            if(!emulation.IsStarted)
+            if(defaultStartEmulation && !emulation.IsStarted)
             {
                 emulation.StartAll();
             }
@@ -225,28 +226,17 @@ namespace Antmicro.Renode.Testing
         {
             var emulation = EmulationManager.Instance.CurrentEmulation;
             this.pauseEmulation = pauseEmulation;
-            // First check if the message has already been received
-            lock(frames)
+
+            if(FindAlreadyReceivedFrame(filter, keep, out var foundFrame))
             {
-                for(var i = 0; i < frames.Count; i++)
+                // Match found so we shortcut
+                if(pauseEmulation)
                 {
-                    var frame = frames[i];
-                    if(filter.IsFrameMatching(frame))
-                    {
-                        // Match found so we shortcut
-                        if(pauseEmulation)
-                        {
-                            emulation.PauseAll();
-                        }
-                        if(!keep)
-                        {
-                            // Consume up to and including the matched frame, otherwise a subsequent wait would return this same (now stale) frame again
-                            frames.RemoveRange(0, i + 1);
-                        }
-                        return frame;
-                    }
+                    emulation.PauseAll();
                 }
+                return foundFrame;
             }
+
             // No matching frames received so setup for waiting
             var timeoutEvent = emulation.MasterTimeSource.EnqueueTimeoutEvent(((ulong)(timeout ?? defaultTimeout).TotalMilliseconds), () =>
             {
@@ -259,7 +249,7 @@ namespace Antmicro.Renode.Testing
             matchedEvent.Reset();
             pendingMatch = filter;
             // If emulation is paused, resume it
-            if(!emulation.IsStarted)
+            if(defaultStartEmulation && !emulation.IsStarted)
             {
                 emulation.StartAll();
             }
@@ -298,6 +288,32 @@ namespace Antmicro.Renode.Testing
 
         public event Action<CANMessageFrame> FrameSent;
 
+        private bool FindAlreadyReceivedFrame(CANMatcher filter, bool keep, out CANMessageFrame foundFrame)
+        {
+            var emulation = EmulationManager.Instance.CurrentEmulation;
+
+            lock(frames)
+            {
+                for(var i = 0; i < frames.Count; i++)
+                {
+                    var frame = frames[i];
+                    if(filter.IsFrameMatching(frame))
+                    {
+                        foundFrame = frame;
+                        if(!keep)
+                        {
+                            // Consume up to and including the matched frame, otherwise a subsequent wait would return this same (now stale) frame again
+                            frames.RemoveRange(0, i + 1);
+                        }
+                        return true;
+                    }
+                }
+            }
+
+            foundFrame = default(CANMessageFrame);
+            return false;
+        }
+
         private CANMessageFrame matchedFrame;
         private CANMatcher pendingMatch;
         private bool pauseEmulation;
@@ -308,6 +324,7 @@ namespace Antmicro.Renode.Testing
         private readonly AutoResetEvent matchedEvent;
 
         private readonly TimeInterval defaultTimeout;
+        private readonly bool defaultStartEmulation;
 
         public class CANMatcher(uint? singleId = null, ISOTP_PCI? isotpType = null)
         {
